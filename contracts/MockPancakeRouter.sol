@@ -2,79 +2,223 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/**
- * @title MockPancakeRouter
- * @notice Minimal mock of PancakeRouter's addLiquidityETH for local testing.
- *         - Transfers the provided token amount from caller to `to`.
- *         - Accepts ETH via `msg.value` and returns amounts in the same shape
- *           as the real router: (amountToken, amountETH, liquidity).
- *         - Does NOT create real LP tokens. Liquidity is represented as a
- *           simple number (amountETH) for testing purposes.
- */
+interface IMockPancakeFactory {
+    function getPair(
+        address tokenA,
+        address tokenB
+    ) external view returns (address);
+
+    function createPair(
+        address tokenA,
+        address tokenB
+    ) external returns (address);
+}
+
+interface IMockPancakePair {
+    function mint(address to, uint256 amount) external;
+
+    function getReserves()
+        external
+        view
+        returns (
+            uint112 _reserve0,
+            uint112 _reserve1,
+            uint32 _blockTimestampLast
+        );
+}
+
 contract MockPancakeRouter {
-    using SafeERC20 for IERC20;
+    address public immutable WETH;
+    address public factory;
 
-    event LiquidityAdded(
-        address indexed token,
-        address indexed sender,
-        address indexed to,
-        uint256 amountToken,
-        uint256 amountETH,
-        uint256 liquidity
-    );
+    // ✅ Store created pairs for easy lookup
+    mapping(address => mapping(address => address)) public pairFor;
 
-    /**
-     * @dev Mocks addLiquidityETH. Caller must approve this contract to spend token.
-     * @param token The ERC20 token address
-     * @param amountTokenDesired Token amount caller wants to add
-     * @param amountTokenMin Minimum token amount (ignored in mock but checked against 0)
-     * @param amountETHMin Minimum ETH amount (compared with msg.value)
-     * @param to Recipient of the "LP" (in real router this is LP token receiver). In your Launchpad you pass 0xdead.
-     * @param deadline Block timestamp after which the call reverts
-     * @return amountToken The token amount actually used (equal to amountTokenDesired)
-     * @return amountETH The ETH amount actually used (equal to msg.value)
-     * @return liquidity A simple liquidity metric (here equal to amountETH)
-     */
+    constructor() {
+        WETH = address(0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd); // Mock WBNB
+    }
+
+    function setFactory(address _factory) external {
+        factory = _factory;
+    }
+
     function addLiquidityETH(
         address token,
-        uint256 amountTokenDesired,
-        uint256 amountTokenMin,
-        uint256 amountETHMin,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
         address to,
-        uint256 deadline
+        uint deadline
     )
         external
         payable
-        returns (uint256 amountToken, uint256 amountETH, uint256 liquidity)
+        returns (uint amountToken, uint amountETH, uint liquidity)
     {
-        require(block.timestamp <= deadline, "MockRouter: deadline passed");
-        require(msg.value >= amountETHMin, "MockRouter: insufficient ETH");
-        require(amountTokenDesired > 0, "MockRouter: zero token amount");
-        require(to != address(0), "MockRouter: bad recipient");
+        require(factory != address(0), "Factory not set");
 
-        // Pull tokens from sender into the recipient `to` (mimics router behaviour)
-        IERC20(token).safeTransferFrom(msg.sender, to, amountTokenDesired);
-
-        amountToken = amountTokenDesired;
-        amountETH = msg.value;
-
-        // This mock does not mint LP tokens. We return a simple liquidity number
-        // (amountETH) to let callers observe something deterministic.
-        liquidity = amountETH;
-
-        emit LiquidityAdded(
-            token,
+        // Transfer tokens from sender
+        IERC20(token).transferFrom(
             msg.sender,
-            to,
-            amountToken,
-            amountETH,
-            liquidity
+            address(this),
+            amountTokenDesired
         );
-        return (amountToken, amountETH, liquidity);
+
+        // Get or create pair
+        address pair = IMockPancakeFactory(factory).getPair(token, WETH);
+        if (pair == address(0)) {
+            pair = IMockPancakeFactory(factory).createPair(token, WETH);
+        }
+
+        // ✅ Store for easy lookup
+        pairFor[token][WETH] = pair;
+        pairFor[WETH][token] = pair;
+
+        // Calculate liquidity (simplified)
+        liquidity = amountTokenDesired + msg.value;
+
+        // Mint LP tokens to recipient
+        IMockPancakePair(pair).mint(to, liquidity);
+
+        return (amountTokenDesired, msg.value, liquidity);
     }
 
-    // Allow contract to receive ETH
+    // Add this to MockPancakeRouter
+    function removeLiquidityETH(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external returns (uint amountToken, uint amountETH) {
+        address pair = IMockPancakeFactory(factory).getPair(token, WETH);
+        require(pair != address(0), "Pair not found");
+
+        // Transfer LP tokens from sender to router
+        IERC20(pair).transferFrom(msg.sender, address(this), liquidity);
+
+        // Calculate ETH amount (simplified - liquidity represents value in Wei)
+        amountETH = liquidity / 2; // Half the liquidity as ETH
+        amountToken = liquidity / 2; // Other half (but we won't transfer)
+
+        // ✅ ONLY send ETH back, DON'T transfer project tokens
+        // (The harvester only needs ETH for fee distribution anyway)
+        if (amountETH > 0) {
+            (bool success, ) = payable(to).call{value: amountETH}("");
+            require(success, "ETH transfer to harvester failed");
+        }
+
+        // Note: We don't transfer project tokens because:
+        // 1. Router doesn't hold them (pair does in real Pancake)
+        // 2. Harvester only needs ETH
+        // 3. Simplifies testing
+
+        return (amountToken, amountETH);
+    }
+
+    // Fund the router with ETH for testing
     receive() external payable {}
+
+    // ✅ SIMPLIFIED - Just send ETH, don't transfer tokens
+    function swapExactTokensForETH(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts) {
+        require(path.length >= 2, "Invalid path");
+        require(path[path.length - 1] == WETH, "Path must end with WETH");
+
+        // Calculate output (simplified 1:1 for testing)
+        uint amountOut = amountIn;
+
+        amounts = new uint[](path.length);
+        amounts[0] = amountIn;
+        amounts[amounts.length - 1] = amountOut;
+
+        // Fill intermediate amounts
+        for (uint i = 1; i < path.length - 1; i++) {
+            amounts[i] = amountIn;
+        }
+
+        require(amountOut >= amountOutMin, "Insufficient output amount");
+
+        // ✅ Just send ETH - don't try to transfer tokens in mock
+        if (address(this).balance >= amountOut) {
+            (bool success, ) = to.call{value: amountOut}("");
+            require(success, "ETH transfer failed");
+        }
+
+        return amounts;
+    }
+
+    // ✅ Add helper function to get pair
+    function getPair(
+        address tokenA,
+        address tokenB
+    ) external view returns (address) {
+        address pair = pairFor[tokenA][tokenB];
+        if (pair == address(0)) {
+            pair = pairFor[tokenB][tokenA];
+        }
+        return pair;
+    }
+
+    function getAmountsOut(
+        uint amountIn,
+        address[] calldata path
+    ) external view returns (uint[] memory amounts) {
+        require(path.length >= 2, "Invalid path");
+        amounts = new uint[](path.length);
+        amounts[0] = amountIn;
+
+        // Simple mock: For token -> WBNB, assume 1:1 ratio for testing
+        // In production, this would calculate based on reserves
+        for (uint i = 0; i < path.length - 1; i++) {
+            address pair = IMockPancakeFactory(factory).getPair(
+                path[i],
+                path[i + 1]
+            );
+
+            if (pair != address(0)) {
+                // Try to get reserves and calculate proper price
+                try IMockPancakePair(pair).getReserves() returns (
+                    uint112 reserve0,
+                    uint112 reserve1,
+                    uint32
+                ) {
+                    address token0 = path[i] < path[i + 1]
+                        ? path[i]
+                        : path[i + 1];
+                    bool isToken0 = path[i] == token0;
+
+                    uint reserveIn = isToken0 ? uint(reserve0) : uint(reserve1);
+                    uint reserveOut = isToken0
+                        ? uint(reserve1)
+                        : uint(reserve0);
+
+                    if (reserveIn > 0 && reserveOut > 0) {
+                        // Use constant product formula: amountOut = (amountIn * reserveOut) / (reserveIn + amountIn)
+                        // Simplified without fees for testing
+                        amounts[i + 1] =
+                            (amounts[i] * reserveOut) /
+                            (reserveIn + amounts[i]);
+                    } else {
+                        // Fallback: 1:1 ratio
+                        amounts[i + 1] = amounts[i];
+                    }
+                } catch {
+                    // Fallback: 1:1 ratio
+                    amounts[i + 1] = amounts[i];
+                }
+            } else {
+                // No pair exists, assume 1:1 for testing
+                amounts[i + 1] = amounts[i];
+            }
+        }
+
+        return amounts;
+    }
 }

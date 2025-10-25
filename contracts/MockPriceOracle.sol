@@ -7,7 +7,7 @@ pragma solidity ^0.8.20;
  * Do NOT use in production!
  */
 contract MockPriceOracle {
-    uint256 public price = 580 * 10**18; // Default: $580/BNB
+    uint256 public price = 50 * 10**18; // Default: $580/BNB
     
     event PriceUpdated(uint256 newPrice);
 

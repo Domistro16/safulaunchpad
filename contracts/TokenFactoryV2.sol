@@ -6,8 +6,8 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
  * @title LaunchpadTokenV2
- * @dev BEP20 token with metadata support (non-upgradeable)
- * Note: Individual tokens don't need to be upgradeable
+ * @dev BEP20 token with transfer lock and metadata support
+ * UPDATED: Transfers are locked until graduation
  */
 contract LaunchpadTokenV2 is ERC20, Ownable {
     uint8 private _decimals;
@@ -22,6 +22,13 @@ contract LaunchpadTokenV2 is ERC20, Ownable {
     }
 
     TokenMetadata public metadata;
+    
+    // Transfer lock mechanism
+    bool public transfersEnabled;
+    mapping(address => bool) public isExemptFromLock;
+
+    event TransfersEnabled(uint256 timestamp);
+    event ExemptionUpdated(address indexed account, bool exempt);
 
     constructor(
         string memory name,
@@ -33,11 +40,67 @@ contract LaunchpadTokenV2 is ERC20, Ownable {
     ) ERC20(name, symbol) Ownable(initialOwner) {
         _decimals = decimalsValue;
         metadata = _metadata;
+        transfersEnabled = false; // Locked by default
+        
+        // Owner and this contract are exempt from lock
+        isExemptFromLock[initialOwner] = true;
+        isExemptFromLock[address(this)] = true;
+        
         _mint(initialOwner, totalSupply);
     }
 
     function decimals() public view virtual override returns (uint8) {
         return _decimals;
+    }
+
+    /**
+     * @dev Override transfer to implement lock mechanism
+     */
+    function _update(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual override {
+        // Allow minting (from == address(0))
+        // Allow burning (to == address(0))
+        // Allow transfers if enabled OR if sender/receiver is exempt
+        if (from != address(0) && to != address(0)) {
+            require(
+                transfersEnabled || isExemptFromLock[from] || isExemptFromLock[to],
+                "Transfers are locked until graduation"
+            );
+        }
+        
+        super._update(from, to, amount);
+    }
+
+    /**
+     * @dev Enable transfers permanently (can only be called once)
+     * Only owner (LaunchpadManager) can call this at graduation
+     */
+    function enableTransfers() external onlyOwner {
+        require(!transfersEnabled, "Transfers already enabled");
+        transfersEnabled = true;
+        emit TransfersEnabled(block.timestamp);
+    }
+
+    /**
+     * @dev Set exemption status for an address
+     * Used to exempt bonding curve contract, PancakeSwap, etc.
+     */
+    function setExemption(address account, bool exempt) external onlyOwner {
+        isExemptFromLock[account] = exempt;
+        emit ExemptionUpdated(account, exempt);
+    }
+
+    /**
+     * @dev Batch set exemptions (gas optimization)
+     */
+    function setExemptions(address[] calldata accounts, bool exempt) external onlyOwner {
+        for (uint256 i = 0; i < accounts.length; i++) {
+            isExemptFromLock[accounts[i]] = exempt;
+            emit ExemptionUpdated(accounts[i], exempt);
+        }
     }
 
     function updateMetadata(TokenMetadata memory _metadata) external onlyOwner {
@@ -48,7 +111,7 @@ contract LaunchpadTokenV2 is ERC20, Ownable {
         return metadata;
     }
 
-    function burn(uint256 amount) external onlyOwner {
+    function burn(uint256 amount) external {
         _burn(msg.sender, amount);
     }
 }
@@ -71,9 +134,6 @@ contract TokenFactoryV2 is Ownable {
 
     constructor() Ownable(msg.sender) {}
 
-    /**
-     * @dev Create token with metadata
-     */
     function createToken(
         string memory name,
         string memory symbol,
@@ -111,9 +171,6 @@ contract TokenFactoryV2 is Ownable {
         return tokenAddress;
     }
 
-    /**
-     * @dev Create token with CREATE2 for vanity address
-     */
     function createTokenWithSalt(
         string memory name,
         string memory symbol,
@@ -152,9 +209,6 @@ contract TokenFactoryV2 is Ownable {
         return tokenAddress;
     }
 
-    /**
-     * @dev Compute address that would be deployed with given salt
-     */
     function computeAddress(
         string memory name,
         string memory symbol,

@@ -6,7 +6,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./BondingDEX.sol";
-import "./PriceOracle.sol";
+import "./MockPancakeRouter.sol";
 
 interface ITokenFactoryV2 {
     struct TokenMetadata {
@@ -38,32 +38,33 @@ interface ITokenFactoryV2 {
     ) external returns (address);
 }
 
-interface IPancakeRouter02 {
-    function addLiquidityETH(
-        address token,
-        uint amountTokenDesired,
-        uint amountTokenMin,
-        uint amountETHMin,
-        address to,
-        uint deadline
-    )
-        external
-        payable
-        returns (uint amountToken, uint amountETH, uint liquidity);
-}
-
 interface IBondingCurveDEXV3 {
-    function createPool(address token, uint256 tokenAmount) external payable;
+    function createPool(
+        address token,
+        uint256 tokenAmount,
+        address creator,
+        bool burnLP
+    ) external payable;
 
     function createInstantLaunchPool(
         address token,
         uint256 tokenAmount,
-        address creator
+        address creator,
+        bool burnLP
     ) external payable;
+
+    function setLPToken(address token) external;
 
     function withdrawGraduatedPool(
         address token
-    ) external returns (uint256 bnbAmount, uint256 tokenAmount);
+    )
+        external
+        returns (
+            uint256 bnbAmount,
+            uint256 tokenAmount,
+            uint256 remainingTokens,
+            address creator
+        );
 
     function getPoolInfo(
         address token
@@ -75,7 +76,9 @@ interface IBondingCurveDEXV3 {
             uint256 marketCapUSD,
             uint256 bnbReserve,
             uint256 tokenReserve,
+            uint256 reservedTokens,
             uint256 currentPrice,
+            uint256 priceMultiplier,
             uint256 graduationProgress,
             bool graduated
         );
@@ -90,17 +93,16 @@ interface IBondingCurveDEXV3 {
 
 /**
  * @title LaunchpadManagerV3
- * @dev Standard version - Supports both Option 1 (project raise) and Option 2 (instant launch)
+ * @dev ✅ UPDATED: Uses only global InfoFi address - no per-project InfoFi wallets
  */
 contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
 
     enum LaunchType {
-        PROJECT_RAISE, // Option 1
-        INSTANT_LAUNCH // Option 2
+        PROJECT_RAISE,
+        INSTANT_LAUNCH
     }
 
-    // Split Launch struct into smaller parts
     struct LaunchBasics {
         address token;
         address founder;
@@ -110,6 +112,7 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         uint256 raiseDeadline;
         uint256 totalRaised;
         LaunchType launchType;
+        bool burnLP;
     }
 
     struct LaunchVesting {
@@ -138,10 +141,9 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         bool claimed;
     }
 
-    // Constants for Option 1 (Project Raise)
-    uint256 public constant MIN_RAISE_USD = 50_000 * 10 ** 18;
-    uint256 public constant MAX_RAISE_USD = 500_000 * 10 ** 18;
-    uint256 public constant MAX_LIQUIDITY_USD = 100_000 * 10 ** 18;
+    uint256 public constant MIN_RAISE_BNB = 0.1 ether;
+    uint256 public constant MAX_RAISE_BNB = 0.5 ether;
+    uint256 public constant MAX_LIQUIDITY_BNB = 0.2 ether;
     uint256 public constant RAISE_DURATION = 24 hours;
     uint256 public constant FOUNDER_ALLOCATION = 20;
     uint256 public constant IMMEDIATE_FOUNDER_RELEASE = 50;
@@ -151,15 +153,19 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
     uint256 public constant MAX_VESTING_DURATION = 180 days;
     uint256 public constant VESTING_RELEASE_INTERVAL = 30 days;
 
-    // Storage variables
+    address public constant LP_BURN_ADDRESS =
+        0x000000000000000000000000000000000000dEaD;
+
     AggregatorV3Interface public priceFeed;
     ITokenFactoryV2 public tokenFactory;
     IBondingCurveDEXV3 public bondingCurveDEX;
     IPancakeRouter02 public pancakeRouter;
     PriceOracle public priceOracle;
-    address public infoFiAddress;
+    address public infoFiAddress; // ✅ Global InfoFi address
+    ILPFeeHarvester public lpFeeHarvester;
+    address public pancakeFactory;
+    address public wbnbAddress;
 
-    // State mappings
     mapping(address => LaunchBasics) public launchBasics;
     mapping(address => LaunchVesting) public launchVesting;
     mapping(address => LaunchLiquidity) public launchLiquidity;
@@ -170,23 +176,24 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
     uint256 public fallbackBNBPrice;
     bool public useOraclePrice;
 
-    // Events
     event LaunchCreated(
         address indexed token,
         address indexed founder,
         uint256 totalSupply,
         LaunchType launchType,
-        uint256 raiseTargetUSD,
         uint256 raiseTargetBNB,
+        uint256 raiseMaxBNB,
         uint256 deadline,
-        bool hasVanitySalt
+        bool hasVanitySalt,
+        bool burnLP
     );
     event InstantLaunchCreated(
         address indexed token,
         address indexed founder,
         uint256 totalSupply,
         uint256 initialBuyAmount,
-        uint256 tokensReceived
+        uint256 tokensReceived,
+        bool burnLP
     );
     event ContributionMade(
         address indexed contributor,
@@ -206,42 +213,58 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
     );
     event RaisedFundsSentToInfoFi(address indexed token, uint256 amount);
     event TokensBurned(address indexed token, uint256 amount);
-    event GraduatedToPancakeSwap(address indexed token, uint256 liquidityAdded);
+    event GraduatedToPancakeSwap(
+        address indexed token,
+        uint256 bnbForLiquidity,
+        uint256 tokensForLiquidity
+    );
+    event LPBurned(
+        address indexed token,
+        address indexed lpToken,
+        uint256 amount
+    );
+    event LPLocked(
+        address indexed token,
+        address indexed lpToken,
+        uint256 amount
+    );
+    event TransfersEnabled(address indexed token, uint256 timestamp);
     event PriceFeedUpdated(address indexed newPriceFeed);
     event FallbackPriceUpdated(uint256 newPrice);
     event OracleModeChanged(bool useOracle);
+    event InfoFiAddressUpdated(address indexed newInfoFiAddress);
 
     constructor(
         address _tokenFactory,
         address _bondingCurveDEX,
         address _pancakeRouter,
         address _priceOracle,
-        address _infoFiAddress
+        address _infoFiAddress,
+        address _lpFeeHarvester,
+        address _pancakeFactory
     ) Ownable(msg.sender) {
         require(_tokenFactory != address(0), "Invalid token factory");
         require(_bondingCurveDEX != address(0), "Invalid bonding DEX");
         require(_pancakeRouter != address(0), "Invalid pancake router");
         require(_priceOracle != address(0), "Invalid price oracle");
         require(_infoFiAddress != address(0), "Invalid InfoFi address");
+        require(_lpFeeHarvester != address(0), "Invalid LP harvester");
+        pancakeFactory = _pancakeFactory;
+        wbnbAddress = address(0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd);
 
         tokenFactory = ITokenFactoryV2(_tokenFactory);
         bondingCurveDEX = IBondingCurveDEXV3(_bondingCurveDEX);
         pancakeRouter = IPancakeRouter02(_pancakeRouter);
         infoFiAddress = _infoFiAddress;
         priceOracle = PriceOracle(_priceOracle);
+        lpFeeHarvester = ILPFeeHarvester(_lpFeeHarvester);
 
         fallbackBNBPrice = 1200 * 10 ** 8;
         useOraclePrice = true;
     }
 
-    /**
-     * @dev Get latest BNB/USD price from Chainlink
-     */
     function getBNBPrice() public view returns (uint256) {
-        if (!useOraclePrice) {
-            return fallbackBNBPrice;
-        }
-
+        if (!useOraclePrice) return fallbackBNBPrice;
         try priceFeed.latestRoundData() returns (
             uint80,
             int256 price,
@@ -257,54 +280,56 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         }
     }
 
-    // ============================================
-    // OPTION 1: PROJECT RAISE (Existing functionality)
-    // ============================================
-
+    // ✅ UPDATED: Removed projectInfoFiWallet parameter
     function createLaunch(
         string memory name,
         string memory symbol,
         uint256 totalSupply,
-        uint256 raiseTargetUSD,
-        uint256 raiseMaxUSD,
+        uint256 raiseTargetBNB,
+        uint256 raiseMaxBNB,
         uint256 vestingDuration,
-        ITokenFactoryV2.TokenMetadata memory metadata
+        ITokenFactoryV2.TokenMetadata memory metadata,
+        bool burnLP
     ) external nonReentrant returns (address) {
         return
             _createLaunch(
                 name,
                 symbol,
                 totalSupply,
-                raiseTargetUSD,
-                raiseMaxUSD,
+                raiseTargetBNB,
+                raiseMaxBNB,
                 vestingDuration,
                 metadata,
                 false,
-                bytes32(0)
+                bytes32(0),
+                burnLP
             );
     }
 
+    // ✅ UPDATED: Removed projectInfoFiWallet parameter
     function createLaunchWithVanity(
         string memory name,
         string memory symbol,
         uint256 totalSupply,
-        uint256 raiseTargetUSD,
-        uint256 raiseMaxUSD,
+        uint256 raiseTargetBNB,
+        uint256 raiseMaxBNB,
         uint256 vestingDuration,
         ITokenFactoryV2.TokenMetadata memory metadata,
-        bytes32 vanitySalt
+        bytes32 vanitySalt,
+        bool burnLP
     ) external nonReentrant returns (address) {
         return
             _createLaunch(
                 name,
                 symbol,
                 totalSupply,
-                raiseTargetUSD,
-                raiseMaxUSD,
+                raiseTargetBNB,
+                raiseMaxBNB,
                 vestingDuration,
                 metadata,
                 true,
-                vanitySalt
+                vanitySalt,
+                burnLP
             );
     }
 
@@ -312,17 +337,15 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         string memory name,
         string memory symbol,
         uint256 totalSupply,
-        uint256 raiseTargetUSD,
-        uint256 raiseMaxUSD,
+        uint256 raiseTargetBNB,
+        uint256 raiseMaxBNB,
         uint256 vestingDuration,
         ITokenFactoryV2.TokenMetadata memory metadata,
         bool useVanity,
-        bytes32 vanitySalt
+        bytes32 vanitySalt,
+        bool burnLP
     ) private returns (address) {
-        _validateLaunchParams(raiseTargetUSD, raiseMaxUSD, vestingDuration);
-
-        uint256 raiseTargetBNB = priceOracle.usdToBNB(raiseTargetUSD);
-        uint256 raiseMaxBNB = priceOracle.usdToBNB(raiseMaxUSD);
+        _validateLaunchParams(raiseTargetBNB, raiseMaxBNB, vestingDuration);
 
         address token = _deployToken(
             name,
@@ -332,13 +355,19 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
             useVanity,
             vanitySalt
         );
+
+        ILaunchpadToken(token).setExemption(address(bondingCurveDEX), true);
+        ILaunchpadToken(token).setExemption(address(pancakeRouter), true);
+        ILaunchpadToken(token).setExemption(address(lpFeeHarvester), true);
+
         _initializeLaunch(
             token,
             totalSupply,
             raiseTargetBNB,
             raiseMaxBNB,
             vestingDuration,
-            LaunchType.PROJECT_RAISE
+            LaunchType.PROJECT_RAISE,
+            burnLP
         );
 
         emit LaunchCreated(
@@ -346,29 +375,23 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
             msg.sender,
             totalSupply * 10 ** 18,
             LaunchType.PROJECT_RAISE,
-            raiseTargetUSD,
             raiseTargetBNB,
+            raiseMaxBNB,
             block.timestamp + RAISE_DURATION,
-            useVanity
+            useVanity,
+            burnLP
         );
 
         return token;
     }
 
-    // ============================================
-    // OPTION 2: INSTANT LAUNCH (New functionality)
-    // ============================================
-
-    /**
-     * @dev Create instant launch token - buy immediately and start trading
-     * @param initialBuyBNB Amount of BNB creator wants to use for initial purchase
-     */
     function createInstantLaunch(
         string memory name,
         string memory symbol,
         uint256 totalSupply,
         ITokenFactoryV2.TokenMetadata memory metadata,
-        uint256 initialBuyBNB
+        uint256 initialBuyBNB,
+        bool burnLP
     ) external payable nonReentrant returns (address) {
         return
             _createInstantLaunch(
@@ -378,7 +401,8 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
                 metadata,
                 initialBuyBNB,
                 false,
-                bytes32(0)
+                bytes32(0),
+                burnLP
             );
     }
 
@@ -388,7 +412,8 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         uint256 totalSupply,
         ITokenFactoryV2.TokenMetadata memory metadata,
         uint256 initialBuyBNB,
-        bytes32 vanitySalt
+        bytes32 vanitySalt,
+        bool burnLP
     ) external payable nonReentrant returns (address) {
         return
             _createInstantLaunch(
@@ -398,7 +423,8 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
                 metadata,
                 initialBuyBNB,
                 true,
-                vanitySalt
+                vanitySalt,
+                burnLP
             );
     }
 
@@ -409,12 +435,11 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         ITokenFactoryV2.TokenMetadata memory metadata,
         uint256 initialBuyBNB,
         bool useVanity,
-        bytes32 vanitySalt
+        bytes32 vanitySalt,
+        bool burnLP
     ) private returns (address) {
-        require(initialBuyBNB > 0, "Initial buy must be > 0");
         require(msg.value >= initialBuyBNB, "Insufficient BNB sent");
 
-        // Deploy token
         address token = _deployToken(
             name,
             symbol,
@@ -424,13 +449,13 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
             vanitySalt
         );
 
-        uint256 totalSupplyWei = totalSupply * 10 ** 18;
+        ILaunchpadToken(token).setExemption(address(bondingCurveDEX), true);
+        ILaunchpadToken(token).setExemption(address(pancakeRouter), true);
+        ILaunchpadToken(token).setExemption(address(lpFeeHarvester), true);
 
-        // For instant launch, all tokens go to bonding curve
-        // No founder allocation, no liquidity reservation
-        uint256 tradingTokens = totalSupplyWei;
+        uint256 totalSupplyWei = 1_000_000_000 * 10 ** 18;
+        require(totalSupply == 1_000_000_000, "Total supply must be 1 billion");
 
-        // Initialize launch basics
         launchBasics[token] = LaunchBasics({
             token: token,
             founder: msg.sender,
@@ -439,45 +464,43 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
             raiseMax: 0,
             raiseDeadline: 0,
             totalRaised: 0,
-            launchType: LaunchType.INSTANT_LAUNCH
+            launchType: LaunchType.INSTANT_LAUNCH,
+            burnLP: burnLP
         });
 
-        // No vesting for instant launches
         launchStatus[token] = LaunchStatus({
-            raiseCompleted: true, // Instant launch is always "completed"
-            liquidityAdded: true, // No separate liquidity step
+            raiseCompleted: true,
+            liquidityAdded: true,
             graduatedToPancakeSwap: false
         });
 
         allLaunches.push(token);
 
-        // Setup bonding curve with small initial liquidity
-        // Use 0.01 BNB as initial liquidity for price discovery
-        uint256 initialLiquidityBNB = 0.1 ether;
-        IERC20(token).approve(address(bondingCurveDEX), tradingTokens);
+        uint256 initialLiquidityBNB = 0;
+        if (msg.value > initialBuyBNB) {
+            initialLiquidityBNB = msg.value - initialBuyBNB;
+        }
+
+        IERC20(token).approve(address(bondingCurveDEX), totalSupplyWei);
         bondingCurveDEX.createInstantLaunchPool{value: initialLiquidityBNB}(
             token,
-            tradingTokens,
-            msg.sender
+            totalSupplyWei,
+            msg.sender,
+            burnLP
         );
-
-        // Execute initial buy from creator
-        uint256 tokensReceived = _executeInitialBuy(token, initialBuyBNB);
+        uint256 tokensReceived = 0;
+        if (initialBuyBNB > 0) {
+            tokensReceived = _executeInitialBuy(token, initialBuyBNB);
+        }
 
         emit InstantLaunchCreated(
             token,
             msg.sender,
             totalSupplyWei,
             initialBuyBNB,
-            tokensReceived
+            tokensReceived,
+            burnLP
         );
-
-        // Return any excess BNB
-        if (msg.value > initialBuyBNB + initialLiquidityBNB) {
-            payable(msg.sender).transfer(
-                msg.value - initialBuyBNB - initialLiquidityBNB
-            );
-        }
 
         return token;
     }
@@ -486,34 +509,125 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         address token,
         uint256 buyAmount
     ) private returns (uint256) {
-        // Get quote for initial buy
         (uint256 tokensOut, ) = bondingCurveDEX.getBuyQuote(token, buyAmount);
 
-        // Execute buy through bonding curve
         bondingCurveDEX.buyTokens{value: buyAmount}(token, tokensOut);
 
-        // Transfer tokens to creator
         uint256 balance = IERC20(token).balanceOf(address(this));
         IERC20(token).safeTransfer(msg.sender, balance);
 
         return balance;
     }
 
-    // ============================================
-    // SHARED FUNCTIONS
-    // ============================================
+    function graduateToPancakeSwap(address token) external nonReentrant {
+        LaunchBasics storage basics = launchBasics[token];
+        LaunchStatus storage status = launchStatus[token];
+
+        require(
+            !status.graduatedToPancakeSwap,
+            "Already graduated to PancakeSwap"
+        );
+
+        (, , , , , , , , bool graduated) = bondingCurveDEX.getPoolInfo(token);
+        require(graduated, "Not ready to graduate");
+
+        (
+            uint256 bnbForLiquidity,
+            uint256 tokensForLiquidity,
+            uint256 remainingTokens,
+            address creator
+        ) = bondingCurveDEX.withdrawGraduatedPool(token);
+
+        require(creator == basics.founder, "Creator mismatch");
+
+        IERC20(token).approve(address(pancakeRouter), tokensForLiquidity);
+
+        (, , uint256 liquidity) = pancakeRouter.addLiquidityETH{
+            value: bnbForLiquidity
+        }(
+            token,
+            tokensForLiquidity,
+            0,
+            0,
+            address(this),
+            block.timestamp + 300
+        );
+
+        require(liquidity > 0, "No liquidity");
+
+        address lpToken = _getPancakePairAddressFromFactory(token, wbnbAddress);
+        require(lpToken != address(0), "LP token not found");
+        bondingCurveDEX.setLPToken(token);
+        if (basics.burnLP) {
+            IERC20(lpToken).safeTransfer(LP_BURN_ADDRESS, liquidity);
+            emit LPBurned(token, lpToken, liquidity);
+        } else {
+            IERC20(lpToken).approve(address(lpFeeHarvester), liquidity);
+
+            // ✅ UPDATED: Always use global infoFiAddress
+            lpFeeHarvester.lockLP(
+                token,
+                lpToken,
+                basics.founder,
+                infoFiAddress,
+                liquidity,
+                0
+            );
+
+            emit LPLocked(token, lpToken, liquidity);
+        }
+
+        ILaunchpadToken(token).enableTransfers();
+
+        status.graduatedToPancakeSwap = true;
+
+        emit GraduatedToPancakeSwap(token, bnbForLiquidity, tokensForLiquidity);
+        emit TransfersEnabled(token, block.timestamp);
+    }
+
+    function _getPancakePairAddressFromFactory(
+        address tokenA,
+        address tokenB
+    ) private view returns (address) {
+        (bool success, bytes memory data) = pancakeFactory.staticcall(
+            abi.encodeWithSignature("getPair(address,address)", tokenA, tokenB)
+        );
+
+        if (success && data.length >= 32) {
+            address pair = abi.decode(data, (address));
+            if (pair != address(0)) {
+                return pair;
+            }
+        }
+
+        (success, data) = pancakeFactory.staticcall(
+            abi.encodeWithSignature("getPair(address,address)", tokenB, tokenA)
+        );
+
+        if (success && data.length >= 32) {
+            return abi.decode(data, (address));
+        }
+
+        return address(0);
+    }
+
+    function _getPancakePairAddress(
+        address token
+    ) private view returns (address) {
+        return _getPancakePairAddressFromFactory(token, wbnbAddress);
+    }
 
     function _validateLaunchParams(
-        uint256 raiseTargetUSD,
-        uint256 raiseMaxUSD,
+        uint256 raiseTargetBNB,
+        uint256 raiseMaxBNB,
         uint256 vestingDuration
     ) private pure {
         require(
-            raiseTargetUSD >= MIN_RAISE_USD && raiseTargetUSD <= MAX_RAISE_USD,
+            raiseTargetBNB >= MIN_RAISE_BNB && raiseTargetBNB <= MAX_RAISE_BNB,
             "Invalid raise target"
         );
         require(
-            raiseMaxUSD >= raiseTargetUSD && raiseMaxUSD <= MAX_RAISE_USD,
+            raiseMaxBNB >= raiseTargetBNB && raiseMaxBNB <= MAX_RAISE_BNB,
             "Invalid raise max"
         );
         require(
@@ -561,11 +675,11 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         uint256 raiseTarget,
         uint256 raiseMax,
         uint256 vestingDuration,
-        LaunchType launchType
+        LaunchType launchType,
+        bool burnLP
     ) private {
         uint256 totalSupplyWei = totalSupply * 10 ** 18;
         uint256 founderTokens = (totalSupplyWei * FOUNDER_ALLOCATION) / 100;
-        uint256 liquidityTokens = (totalSupplyWei * LIQUIDITY_PERCENT) / 100;
 
         launchBasics[token] = LaunchBasics({
             token: token,
@@ -575,7 +689,8 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
             raiseMax: raiseMax,
             raiseDeadline: block.timestamp + RAISE_DURATION,
             totalRaised: 0,
-            launchType: launchType
+            launchType: launchType,
+            burnLP: burnLP
         });
 
         launchVesting[token] = LaunchVesting({
@@ -588,7 +703,7 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
 
         launchLiquidity[token] = LaunchLiquidity({
             liquidityBNB: 0,
-            liquidityTokens: liquidityTokens,
+            liquidityTokens: 0,
             raisedFundsVesting: 0,
             raisedFundsClaimed: 0
         });
@@ -601,10 +716,6 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
 
         allLaunches.push(token);
     }
-
-    // ============================================
-    // OPTION 1 SPECIFIC FUNCTIONS (Unchanged)
-    // ============================================
 
     function contribute(address token) external payable nonReentrant {
         LaunchBasics storage basics = launchBasics[token];
@@ -648,17 +759,14 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         uint256 liquidityBNB = (basics.totalRaised * LIQUIDITY_BNB_PERCENT) /
             100;
 
-        uint256 maxLiquidityBNB = priceOracle.usdToBNB(MAX_LIQUIDITY_USD);
-        if (liquidityBNB > maxLiquidityBNB) {
-            liquidityBNB = maxLiquidityBNB;
+        if (liquidityBNB > MAX_LIQUIDITY_BNB) {
+            liquidityBNB = MAX_LIQUIDITY_BNB;
         }
 
         liquidity.liquidityBNB = liquidityBNB;
         liquidity.raisedFundsVesting = basics.totalRaised - liquidityBNB;
 
-        uint256 tradingTokens = basics.totalSupply -
-            vesting.founderTokens -
-            liquidity.liquidityTokens;
+        uint256 tradingTokens = (basics.totalSupply * 70) / 100;
 
         vesting.startMarketCap =
             (liquidityBNB * basics.totalSupply) /
@@ -673,7 +781,6 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
             token,
             basics.totalSupply,
             vesting.founderTokens,
-            liquidity.liquidityTokens,
             liquidityBNB
         );
 
@@ -685,12 +792,18 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         address token,
         uint256 totalSupply,
         uint256 founderTokens,
-        uint256 liquidityTokens,
         uint256 liquidityBNB
     ) private {
-        uint256 tradingTokens = totalSupply - founderTokens - liquidityTokens;
-        IERC20(token).approve(address(bondingCurveDEX), tradingTokens);
-        bondingCurveDEX.createPool{value: liquidityBNB}(token, tradingTokens);
+        LaunchBasics storage basics = launchBasics[token];
+        uint256 tokensForDEX = totalSupply - founderTokens;
+
+        IERC20(token).approve(address(bondingCurveDEX), tokensForDEX);
+        bondingCurveDEX.createPool{value: liquidityBNB}(
+            token,
+            tokensForDEX,
+            basics.founder,
+            basics.burnLP
+        );
     }
 
     function claimFounderTokens(address token) external nonReentrant {
@@ -733,6 +846,7 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         bool shouldRedirect = _shouldBurnTokens(token);
 
         if (shouldRedirect) {
+            // ✅ UPDATED: Use global infoFiAddress
             payable(infoFiAddress).transfer(claimable);
             emit RaisedFundsSentToInfoFi(token, claimable);
         } else {
@@ -744,7 +858,9 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
     }
 
     function _shouldBurnTokens(address token) private view returns (bool) {
-        (, , , , uint256 currentPrice, , ) = bondingCurveDEX.getPoolInfo(token);
+        (, , , , , uint256 currentPrice, , , ) = bondingCurveDEX.getPoolInfo(
+            token
+        );
         LaunchBasics storage basics = launchBasics[token];
         LaunchVesting storage vesting = launchVesting[token];
         uint256 startPrice = (vesting.startMarketCap * 10 ** 18) /
@@ -796,59 +912,19 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
             return liquidity.raisedFundsVesting - liquidity.raisedFundsClaimed;
         }
 
-        uint256 totalVested = (liquidity.raisedFundsVesting * timePassed) /
-            vesting.vestingDuration;
+        // ✅ MONTHLY VESTING (same as founder tokens)
+        uint256 monthsPassed = timePassed / VESTING_RELEASE_INTERVAL;
+        uint256 totalMonths = vesting.vestingDuration /
+            VESTING_RELEASE_INTERVAL;
+
+        uint256 totalVested = (liquidity.raisedFundsVesting * monthsPassed) /
+            totalMonths;
 
         if (totalVested <= liquidity.raisedFundsClaimed) {
             return 0;
         }
         return totalVested - liquidity.raisedFundsClaimed;
     }
-
-    function graduateToPancakeSwap(address token) external nonReentrant {
-        LaunchBasics storage basics = launchBasics[token];
-        LaunchStatus storage status = launchStatus[token];
-
-        require(
-            basics.launchType == LaunchType.PROJECT_RAISE,
-            "Not a project raise"
-        );
-        require(status.raiseCompleted, "Raise not completed");
-        require(!status.graduatedToPancakeSwap, "Already graduated");
-
-        (, , , , , , bool graduated) = bondingCurveDEX.getPoolInfo(token);
-        require(graduated, "Not ready to graduate");
-
-        (uint256 bnbFromPool, uint256 tokensFromPool) = bondingCurveDEX
-            .withdrawGraduatedPool(token);
-
-        LaunchLiquidity storage liquidity = launchLiquidity[token];
-
-        uint256 bnbForPancake = bnbFromPool;
-        uint256 tokensForPancake = liquidity.liquidityTokens;
-
-        if (tokensFromPool > 0) {
-            IERC20(token).safeTransfer(address(0xdead), tokensFromPool);
-        }
-
-        IERC20(token).approve(address(pancakeRouter), tokensForPancake);
-
-        pancakeRouter.addLiquidityETH{value: bnbForPancake}(
-            token,
-            tokensForPancake,
-            0,
-            0,
-            address(0xdead),
-            block.timestamp + 300
-        );
-
-        status.graduatedToPancakeSwap = true;
-        emit GraduatedToPancakeSwap(token, bnbForPancake);
-    }
-
-    // ============================================
-    // VIEW FUNCTIONS
-    // ============================================
 
     function updatePriceFeed(address _priceFeed) external onlyOwner {
         require(_priceFeed != address(0), "Invalid address");
@@ -862,6 +938,19 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         emit FallbackPriceUpdated(_price);
     }
 
+    function updateLPFeeHarvester(address _lpFeeHarvester) external onlyOwner {
+        require(_lpFeeHarvester != address(0), "Invalid address");
+        lpFeeHarvester = ILPFeeHarvester(_lpFeeHarvester);
+    }
+
+    // ✅ NEW: Function to update global InfoFi address
+    function updateInfoFiAddress(address _infoFiAddress) external onlyOwner {
+        require(_infoFiAddress != address(0), "Invalid address");
+        infoFiAddress = _infoFiAddress;
+        emit InfoFiAddressUpdated(_infoFiAddress);
+    }
+
+    // ✅ UPDATED: Removed projectInfoFiWallet from return values
     function getLaunchInfo(
         address token
     )
@@ -877,7 +966,8 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
             bool graduatedToPancakeSwap,
             uint256 raisedFundsVesting,
             uint256 raisedFundsClaimed,
-            LaunchType launchType
+            LaunchType launchType,
+            bool burnLP
         )
     {
         LaunchBasics storage basics = launchBasics[token];
@@ -894,7 +984,8 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
             status.graduatedToPancakeSwap,
             liquidity.raisedFundsVesting,
             liquidity.raisedFundsClaimed,
-            basics.launchType
+            basics.launchType,
+            basics.burnLP
         );
     }
 
@@ -913,7 +1004,8 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
             uint256 totalRaisedUSD,
             uint256 raiseDeadline,
             bool raiseCompleted,
-            LaunchType launchType
+            LaunchType launchType,
+            bool burnLP
         )
     {
         LaunchBasics storage basics = launchBasics[token];
@@ -929,7 +1021,8 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
             priceOracle.bnbToUSD(basics.totalRaised),
             basics.raiseDeadline,
             status.raiseCompleted,
-            basics.launchType
+            basics.launchType,
+            basics.burnLP
         );
     }
 
@@ -944,7 +1037,6 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
                 _calculateClaimableRaisedFunds(token)
             );
         } else {
-            // Instant launches have no vesting
             return (0, 0);
         }
     }

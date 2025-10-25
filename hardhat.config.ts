@@ -4,7 +4,6 @@ import { configVariable } from "hardhat/config";
 import hardhatNetworkHelpers from "@nomicfoundation/hardhat-network-helpers";
 import hardhatNetworkHelpersPlugin from "@nomicfoundation/hardhat-network-helpers";
 import hardhatTypechain from "@nomicfoundation/hardhat-typechain";
-
 const config: HardhatUserConfig = {
   plugins: [
     hardhatToolboxMochaEthersPlugin,
@@ -12,6 +11,7 @@ const config: HardhatUserConfig = {
     hardhatNetworkHelpers,
     hardhatTypechain,
   ],
+ 
   solidity: {
     profiles: {
       default: {
@@ -41,11 +41,25 @@ const config: HardhatUserConfig = {
       type: "edr-simulated",
       chainType: "l1",
       allowUnlimitedContractSize: true,
+      forking: {
+        enabled: true,
+        url: "https://bsc-testnet-rpc.publicnode.com",
+      },
     },
     hardhatOp: {
       type: "edr-simulated",
       chainType: "op",
       allowUnlimitedContractSize: true,
+      forking: {
+        enabled: true,
+        url: "https://bsc-testnet-rpc.publicnode.com",
+      },
+    },
+    testnet: {
+      type: "http",
+      chainType: "l1",
+      url: configVariable("RPC_URL"),
+      accounts: [configVariable("PRIVATE_KEY")],
     },
     sepolia: {
       type: "http",
