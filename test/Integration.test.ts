@@ -65,6 +65,13 @@ describe("Integration Tests - Complete Launch Lifecycle with LP Harvester", func
     await priceOracle.waitForDeployment();
     await priceOracle.setBNBPrice(BNB_PRICE_USD);
 
+    // Deploy MockPancakeFactory first
+    const MockPancakeFactory = await ethers.getContractFactory(
+      "MockPancakeFactory"
+    );
+    mockPancakeFactory = await MockPancakeFactory.deploy();
+    await mockPancakeFactory.waitForDeployment();
+
     // Deploy MockPancakeRouter
     const MockPancakeRouter = await ethers.getContractFactory(
       "MockPancakeRouter"
@@ -72,16 +79,25 @@ describe("Integration Tests - Complete Launch Lifecycle with LP Harvester", func
     mockPancakeRouter = await MockPancakeRouter.deploy();
     await mockPancakeRouter.waitForDeployment();
 
-    // Deploy MockPancakeFactory
-    const MockPancakeFactory = await ethers.getContractFactory(
-      "MockPancakeFactory"
-    );
-    mockPancakeFactory = await MockPancakeFactory.deploy();
-    await mockPancakeFactory.waitForDeployment();
+    // ✅ Connect factory to router
+    await mockPancakeRouter.setFactory(await mockPancakeFactory.getAddress());
+
+    const PANCAKE_ROUTER = await mockPancakeRouter.getAddress();
+    const PANCAKE_FACTORY = await mockPancakeFactory.getAddress();
 
     const TokenFactoryV2 = await ethers.getContractFactory("TokenFactoryV2");
     tokenFactory = await TokenFactoryV2.deploy();
     await tokenFactory.waitForDeployment();
+
+    // Deploy LPFeeHarvester
+    const LPFeeHarvester = await ethers.getContractFactory("LPFeeHarvester");
+    lpFeeHarvester = await LPFeeHarvester.deploy(
+      PANCAKE_ROUTER,
+      PANCAKE_FACTORY,
+      platformFee.address,
+      owner.address // admin
+    );
+    await lpFeeHarvester.waitForDeployment();
 
     const BondingCurveDEX = await ethers.getContractFactory("BondingCurveDEX");
     bondingCurveDEX = await BondingCurveDEX.deploy(
@@ -89,19 +105,12 @@ describe("Integration Tests - Complete Launch Lifecycle with LP Harvester", func
       academyFee.address,
       infoFiFee.address,
       await priceOracle.getAddress(),
-      owner.address // admin
+      owner.address, // admin
+      PANCAKE_ROUTER,
+      PANCAKE_FACTORY,
+      await lpFeeHarvester.getAddress()
     );
     await bondingCurveDEX.waitForDeployment();
-
-    // Deploy LPFeeHarvester
-    const LPFeeHarvester = await ethers.getContractFactory("LPFeeHarvester");
-    lpFeeHarvester = await LPFeeHarvester.deploy(
-      await mockPancakeRouter.getAddress(),
-      await mockPancakeFactory.getAddress(),
-      platformFee.address,
-      owner.address // admin
-    );
-    await lpFeeHarvester.waitForDeployment();
 
     const LaunchpadManagerV3 = await ethers.getContractFactory(
       "LaunchpadManagerV3"
@@ -109,10 +118,12 @@ describe("Integration Tests - Complete Launch Lifecycle with LP Harvester", func
     launchpadManager = await LaunchpadManagerV3.deploy(
       await tokenFactory.getAddress(),
       await bondingCurveDEX.getAddress(),
-      await mockPancakeRouter.getAddress(),
+      PANCAKE_ROUTER,
       await priceOracle.getAddress(),
       infoFiFee.address,
-      await lpFeeHarvester.getAddress()
+      platformFee.address, // ✅ NEW: Platform fee address
+      await lpFeeHarvester.getAddress(),
+      PANCAKE_FACTORY
     );
     await launchpadManager.waitForDeployment();
 
@@ -148,8 +159,7 @@ describe("Integration Tests - Complete Launch Lifecycle with LP Harvester", func
           RAISE_MAX_USD,
           VESTING_DURATION,
           defaultMetadata,
-          infoFiFee.address,
-          true
+          false // burnLP
         );
 
       const createReceipt = await createTx.wait();
@@ -439,7 +449,7 @@ describe("Integration Tests - Complete Launch Lifecycle with LP Harvester", func
           1_000_000_000, // 1 billion
           defaultMetadata,
           initialBuy,
-          true,
+          false, // burnLP
           { value: totalValue }
         );
 
@@ -631,7 +641,7 @@ describe("Integration Tests - Complete Launch Lifecycle with LP Harvester", func
           1_000_000_000,
           defaultMetadata,
           initialBuy,
-          true,
+          false, // burnLP
           { value: totalValue }
         );
 
@@ -720,8 +730,7 @@ describe("Integration Tests - Complete Launch Lifecycle with LP Harvester", func
           RAISE_MAX_USD,
           VESTING_DURATION,
           defaultMetadata,
-          infoFiFee.address,
-          true
+          false // burnLP
         );
 
       const receipt = await tx.wait();
@@ -948,8 +957,7 @@ describe("Integration Tests - Complete Launch Lifecycle with LP Harvester", func
             RAISE_MAX_USD,
             VESTING_DURATION,
             defaultMetadata,
-            infoFiFee.address,
-            true
+            false // burnLP
           );
 
         const receipt = await tx.wait();
@@ -995,7 +1003,7 @@ describe("Integration Tests - Complete Launch Lifecycle with LP Harvester", func
           1_000_000_000,
           defaultMetadata,
           ethers.parseEther("1"),
-          true,
+          false, // burnLP
           { value: ethers.parseEther("11") }
         );
 
