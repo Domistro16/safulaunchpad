@@ -44,7 +44,7 @@ describe("BondingCurveDEX - INSTANT_LAUNCH Tests", function () {
   let mockPancakeFactory: MockPancakeFactory;
 
   const INITIAL_LIQUIDITY_BNB = ethers.parseEther("50");
-  const INITIAL_LIQUIDITY_TOKENS = ethers.parseEther("700000000");
+  const INITIAL_LIQUIDITY_TOKENS = ethers.parseEther("900000000"); // ✅ FIXED: Must be 90% of 1B for createPool
   const BNB_PRICE_USD = ethers.parseEther("580"); // $580 per BNB
 
   const defaultMetadata = {
@@ -162,9 +162,9 @@ describe("BondingCurveDEX - INSTANT_LAUNCH Tests", function () {
         await token.getAddress()
       );
 
-      // ✅ FIXED: Expected reserve is now 630M (90% of 700M = tokens on curve)
-      // Note: This is for INSTANT_LAUNCH pools, not PROJECT_RAISE
-      const expectedReserve = (INITIAL_LIQUIDITY_TOKENS * 90n) / 100n;
+      // ✅ FIXED: Expected reserve is 800M tokens on curve
+      // Input: 900M (90% of 1B), Reserved: 100M (10% of 1B), On curve: 800M (80% of 1B)
+      const expectedReserve = ethers.parseEther("800000000"); // 800M tokens
       expect(poolInfo.bnbReserve).to.equal(INITIAL_LIQUIDITY_BNB);
       expect(poolInfo.tokenReserve).to.equal(expectedReserve);
       expect(poolInfo.graduated).to.be.false;
