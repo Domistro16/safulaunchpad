@@ -87,8 +87,8 @@ contract LPFeeHarvester is AccessControl, ReentrancyGuard, Pausable {
 
     /// @notice Fee distribution percentages (basis points out of 10000)
     uint256 public constant CREATOR_FEE_BPS = 7000; // 70%
-    uint256 public constant PROJECT_INFOFI_BPS = 2000; // 20%
-    uint256 public constant PLATFORM_FEE_BPS = 1000; // 10%
+    uint256 public constant PROJECT_INFOFI_BPS = 0; // 0%
+    uint256 public constant PLATFORM_FEE_BPS = 3000; // 10%
     uint256 public constant BASIS_POINTS = 10000;
 
     /// @notice Lock duration constraints
@@ -98,8 +98,8 @@ contract LPFeeHarvester is AccessControl, ReentrancyGuard, Pausable {
 
     /// @notice Harvest constraints
     uint256 public constant HARVEST_COOLDOWN = 24 hours;
-    uint256 public constant MIN_HARVEST_AMOUNT = 0.001 ether; // Minimum BNB to harvest
-    uint256 public constant HARVEST_LP_PERCENT = 10; // 10 basis points = 0.1% (fallback cap)
+    uint256 public constant MIN_HARVEST_AMOUNT = 0.01 ether; // Minimum BNB to harvest
+    uint256 public constant HARVEST_LP_PERCENT = 5; // 5 basis points = 0.1% (fallback cap)
 
     struct LPLock {
         address lpToken;

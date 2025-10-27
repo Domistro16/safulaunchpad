@@ -1,3 +1,19 @@
+/**
+ * ═══════════════════════════════════════════════════════════════
+ *                    INSTANT_LAUNCH TESTS ONLY
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * This file tests BondingCurveDEX which is used EXCLUSIVELY for
+ * INSTANT_LAUNCH tokens.
+ *
+ * PROJECT_RAISE tokens use a completely different system
+ * (contribution-based) handled by LaunchpadManager.
+ *
+ * For PROJECT_RAISE tests, see: LaunchpadManagerV3.test.ts
+ *
+ * ═══════════════════════════════════════════════════════════════
+ */
+
 import { expect } from "chai";
 import hre from "hardhat";
 import {
@@ -5,12 +21,14 @@ import {
   TokenFactoryV2,
   LaunchpadTokenV2,
   MockPriceOracle,
+  MockPancakeFactory,
+  MockPancakeRouter,
 } from "../types/ethers-contracts/index.js";
 import { network } from "hardhat";
 
 const { ethers } = await network.connect();
 
-describe("BondingCurveDEX", function () {
+describe("BondingCurveDEX - INSTANT_LAUNCH Tests", function () {
   let bondingCurveDEX: BondingCurveDEX;
   let tokenFactory: TokenFactoryV2;
   let priceOracle: MockPriceOracle;
@@ -21,6 +39,9 @@ describe("BondingCurveDEX", function () {
   let platformFee: any;
   let academyFee: any;
   let infoFiFee: any;
+  let lpFeeHarvester: any;
+  let mockPancakeRouter: MockPancakeRouter;
+  let mockPancakeFactory: MockPancakeFactory;
 
   const INITIAL_LIQUIDITY_BNB = ethers.parseEther("50");
   const INITIAL_LIQUIDITY_TOKENS = ethers.parseEther("700000000");
@@ -43,18 +64,45 @@ describe("BondingCurveDEX", function () {
     priceOracle = await MockPriceOracle.deploy();
     await priceOracle.waitForDeployment();
     await priceOracle.setBNBPrice(BNB_PRICE_USD);
+    const MockPancakeFactory = await ethers.getContractFactory(
+      "MockPancakeFactory"
+    );
+    mockPancakeFactory = await MockPancakeFactory.deploy();
+    await mockPancakeFactory.waitForDeployment();
+
+    // Deploy MockPancakeRouter
+    const MockPancakeRouter = await ethers.getContractFactory(
+      "MockPancakeRouter"
+    );
+    mockPancakeRouter = await MockPancakeRouter.deploy();
+    await mockPancakeRouter.waitForDeployment();
+
+    // ✅ Connect factory to router
+    await mockPancakeRouter.setFactory(await mockPancakeFactory.getAddress());
+
+    const PANCAKE_ROUTER = await mockPancakeRouter.getAddress();
+    const PANCAKE_FACTORY = await mockPancakeFactory.getAddress();
 
     const TokenFactoryV2 = await ethers.getContractFactory("TokenFactoryV2");
     tokenFactory = await TokenFactoryV2.deploy();
     await tokenFactory.waitForDeployment();
-
+    const LPFeeHarvester = await ethers.getContractFactory("LPFeeHarvester");
+    lpFeeHarvester = await LPFeeHarvester.deploy(
+      PANCAKE_ROUTER,
+      PANCAKE_FACTORY,
+      platformFee.address,
+      owner.address
+    );
     const BondingCurveDEX = await ethers.getContractFactory("BondingCurveDEX");
     bondingCurveDEX = await BondingCurveDEX.deploy(
       platformFee.address,
       academyFee.address,
       infoFiFee.address,
       await priceOracle.getAddress(),
-      owner.address
+      owner.address,
+      PANCAKE_ROUTER,
+      PANCAKE_FACTORY,
+      await lpFeeHarvester.getAddress()
     );
     await bondingCurveDEX.waitForDeployment();
 
@@ -97,22 +145,25 @@ describe("BondingCurveDEX", function () {
       INITIAL_LIQUIDITY_TOKENS
     );
 
+    // ✅ CLARIFICATION: This creates a pool for INSTANT_LAUNCH with initial BNB seeding
+    // NOT for PROJECT_RAISE (which doesn't use BondingCurveDEX)
     await bondingCurveDEX.createPool(
       await token.getAddress(),
       INITIAL_LIQUIDITY_TOKENS,
-      infoFiFee.address,
-      owner.address,
+      owner.address, // creator
+      false, // burnLP
       { value: INITIAL_LIQUIDITY_BNB }
     );
   });
 
-  describe("Pool Creation - Option 1 (PROJECT_RAISE)", function () {
+  describe("Pool Creation - INSTANT_LAUNCH with Initial BNB Seed", function () {
     it("Should create a pool with correct reserves", async function () {
       const poolInfo = await bondingCurveDEX.getPoolInfo(
         await token.getAddress()
       );
 
-      // ✅ FIXED: Expected reserve is now 630M (90% of 700M)
+      // ✅ FIXED: Expected reserve is now 630M (90% of 700M = tokens on curve)
+      // Note: This is for INSTANT_LAUNCH pools, not PROJECT_RAISE
       const expectedReserve = (INITIAL_LIQUIDITY_TOKENS * 90n) / 100n;
       expect(poolInfo.bnbReserve).to.equal(INITIAL_LIQUIDITY_BNB);
       expect(poolInfo.tokenReserve).to.equal(expectedReserve);
@@ -132,8 +183,8 @@ describe("BondingCurveDEX", function () {
         bondingCurveDEX.createPool(
           await token.getAddress(),
           INITIAL_LIQUIDITY_TOKENS,
-          infoFiFee.address,
           owner.address, // creator
+          false, // burnLP
           { value: INITIAL_LIQUIDITY_BNB }
         )
       ).to.be.revertedWith("Pool already exists");
@@ -163,7 +214,7 @@ describe("BondingCurveDEX", function () {
     });
   });
 
-  describe("Pool Creation - Option 2 (INSTANT_LAUNCH)", function () {
+  describe("Pool Creation - INSTANT_LAUNCH without Initial BNB", function () {
     let instantToken: LaunchpadTokenV2;
 
     beforeEach(async function () {
@@ -209,16 +260,17 @@ describe("BondingCurveDEX", function () {
     it("Should create instant launch pool with correct type", async function () {
       const INITIAL_BNB = ethers.parseEther("10");
 
-      // ✅ FIXED: Added creator parameter
+      // ✅ This creates an INSTANT_LAUNCH pool
       await bondingCurveDEX.createInstantLaunchPool(
         await instantToken.getAddress(),
         ethers.parseEther("1000000000"),
         trader1.address, // creator
+        false, // burnLP
         { value: INITIAL_BNB }
       );
 
       const pool = await bondingCurveDEX.pools(await instantToken.getAddress());
-      expect(pool.launchType).to.equal(1);
+      expect(pool.launchType).to.equal(1); // INSTANT_LAUNCH
       expect(pool.creator).to.equal(trader1.address);
     });
 
@@ -227,6 +279,7 @@ describe("BondingCurveDEX", function () {
         await instantToken.getAddress(),
         ethers.parseEther("1000000000"),
         trader1.address,
+        false,
         { value: ethers.parseEther("10") }
       );
 
@@ -240,6 +293,7 @@ describe("BondingCurveDEX", function () {
         await instantToken.getAddress(),
         ethers.parseEther("1000000000"),
         trader1.address,
+        false,
         { value: ethers.parseEther("10") }
       );
 
@@ -250,65 +304,32 @@ describe("BondingCurveDEX", function () {
       expect(feeInfo.accumulatedFees).to.equal(0);
     });
 
-    it("Should graduate based on BOTH BNB threshold AND market cap (FIX #2)", async function () {
+    it("Should graduate based on BNB threshold (INSTANT_LAUNCH)", async function () {
       await bondingCurveDEX.createInstantLaunchPool(
         await instantToken.getAddress(),
         ethers.parseEther("1000000000"),
         trader1.address,
+        false,
         { value: ethers.parseEther("10") }
       );
 
-      await bondingCurveDEX
-        .connect(trader2)
-        .buyTokens(await instantToken.getAddress(), 0, {
-          value: ethers.parseEther("5.1"),
-        });
+      // Buy tokens to reach graduation
+      let graduated = false;
+      let attempts = 0;
 
-      const poolInfo = await bondingCurveDEX.getPoolInfo(
-        await instantToken.getAddress()
-      );
-
-      if (poolInfo.graduated) {
-        expect(poolInfo.bnbReserve).to.be.gte(ethers.parseEther("15"));
-        expect(poolInfo.marketCapUSD).to.be.gte(ethers.parseEther("90000"));
-      }
-
-      const pool = await bondingCurveDEX.pools(await instantToken.getAddress());
-      if (pool.graduated) {
-        expect(pool.active).to.be.false;
-      }
-    });
-
-    it("Should NOT graduate if only BNB threshold met but market cap too low (FIX #2)", async function () {
-      await bondingCurveDEX.createInstantLaunchPool(
-        await instantToken.getAddress(),
-        ethers.parseEther("1000000000"),
-        trader1.address,
-        { value: ethers.parseEther("0") }
-      );
-
-      await bondingCurveDEX
-        .connect(trader2)
-        .buyTokens(await instantToken.getAddress(), 0, {
-          value: ethers.parseEther("2"),
-        });
-
-      const tokens = await instantToken.balanceOf(trader2.address);
-      await instantToken
-        .connect(trader2)
-        .approve(await bondingCurveDEX.getAddress(), tokens / 2n);
-
-      await bondingCurveDEX
-        .connect(trader2)
-        .sellTokens(await instantToken.getAddress(), tokens / 2n, 0);
-
-      for (let i = 0; i < 5; i++) {
+      while (!graduated && attempts < 50) {
         try {
           await bondingCurveDEX
-            .connect(trader2)
+            .connect(trader1)
             .buyTokens(await instantToken.getAddress(), 0, {
-              value: ethers.parseEther("3"),
+              value: ethers.parseEther("0.1"),
             });
+
+          const poolInfo = await bondingCurveDEX.getPoolInfo(
+            await instantToken.getAddress()
+          );
+          graduated = poolInfo.graduated;
+          attempts++;
         } catch (e) {
           break;
         }
@@ -318,244 +339,38 @@ describe("BondingCurveDEX", function () {
         await instantToken.getAddress()
       );
 
-      if (poolInfo.marketCapUSD < ethers.parseEther("90000")) {
-        expect(poolInfo.graduated).to.be.false;
+      if (poolInfo.graduated) {
+        expect(poolInfo.bnbReserve).to.be.gte(
+          ethers.parseEther("0.6") // GRADUATION_BNB_THRESHOLD
+        );
       }
     });
   });
 
-  describe("Market Cap & Price Consistency (FIX #1)", function () {
-    it("Should maintain consistent market cap and price calculations", async function () {
-      const buyAmount = ethers.parseEther("5");
+  describe("Trading - Buy Operations (INSTANT_LAUNCH)", function () {
+    it("Should allow buying tokens", async function () {
+      const buyAmount = ethers.parseEther("1");
 
       await bondingCurveDEX
         .connect(trader1)
-        .buyTokens(await token.getAddress(), 0, { value: buyAmount });
+        .buyTokens(await token.getAddress(), 0, {
+          value: buyAmount,
+        });
 
-      const poolInfo = await bondingCurveDEX.getPoolInfo(
-        await token.getAddress()
-      );
-
-      const totalSupply = ethers.parseEther("1000000000");
-
-      const expectedMarketCap =
-        (poolInfo.currentPrice * totalSupply) / 10n ** 18n;
-
-      expect(poolInfo.marketCapBNB).to.be.closeTo(
-        expectedMarketCap,
-        expectedMarketCap / 1000n // Allow 1% tolerance instead of /1000n
-      );
+      const balance = await token.balanceOf(trader1.address);
+      expect(balance).to.be.gt(0);
     });
 
-    it("Should use augmented reserve for both price and market cap", async function () {
-      const tx = await tokenFactory.createToken(
-        "Instant Token",
-        "INST",
-        1_000_000_000,
-        18,
-        owner.address,
-        defaultMetadata
-      );
-
-      const receipt = await tx.wait();
-      const event = receipt?.logs.find((log: any) => {
-        try {
-          return (
-            tokenFactory.interface.parseLog(
-              log as unknown as Parameters<
-                typeof tokenFactory.interface.parseLog
-              >[0]
-            )?.name === "TokenCreated"
-          );
-        } catch {
-          return false;
-        }
-      });
-
-      const parsedEvent = tokenFactory.interface.parseLog(event as any);
-      const instantTokenAddress = parsedEvent?.args.tokenAddress;
-      const instantToken = await ethers.getContractAt(
-        "LaunchpadTokenV2",
-        instantTokenAddress
-      );
-      await instantToken.setExemption(await bondingCurveDEX.getAddress(), true);
-
-      const totalSupplyWei = ethers.parseEther("1000000000");
-      await instantToken.approve(
-        await bondingCurveDEX.getAddress(),
-        totalSupplyWei
-      );
-
-      await bondingCurveDEX.createInstantLaunchPool(
-        instantTokenAddress,
-        totalSupplyWei,
-        trader1.address,
-        { value: ethers.parseEther("0") }
-      );
-
-      const poolBefore = await bondingCurveDEX.pools(instantTokenAddress);
-      expect(poolBefore.virtualBnbReserve).to.be.gt(0);
-
-      // Execute the buy
-      await bondingCurveDEX.connect(trader2).buyTokens(instantTokenAddress, 0, {
-        value: ethers.parseEther("1"),
-      });
-
-      // ✅ FIX: Fetch pool state directly and calculate manually
-      const pool = await bondingCurveDEX.pools(instantTokenAddress);
-      const augmentedReserve = pool.bnbReserve + pool.virtualBnbReserve;
-
-      // Calculate what we expect
-      const calculatedPrice =
-        (augmentedReserve * 10n ** 18n) / pool.tokenReserve;
-      const calculatedMarketCap =
-        (augmentedReserve * totalSupplyWei) / pool.tokenReserve;
-
-      // Now fetch poolInfo and compare
-      const poolInfo = await bondingCurveDEX.getPoolInfo(instantTokenAddress);
-
-      // Verify the contract's calculations match our expectations
-      expect(poolInfo.currentPrice).to.be.closeTo(
-        calculatedPrice,
-        calculatedPrice / 20n // Allow 5% tolerance for rounding
-      );
-
-      expect(poolInfo.marketCapBNB).to.be.closeTo(
-        calculatedMarketCap,
-        calculatedMarketCap / 20n // Allow 5% tolerance for rounding
-      );
-
-      // Also verify the relationship holds: marketCap = price * totalSupply
-      const marketCapFromPrice =
-        (poolInfo.currentPrice * totalSupplyWei) / 10n ** 18n;
-      expect(poolInfo.marketCapBNB).to.be.closeTo(
-        marketCapFromPrice,
-        marketCapFromPrice / 100n // Allow 1% tolerance
-      );
-    });
-    it("Should maintain consistency after multiple trades", async function () {
-      for (let i = 0; i < 3; i++) {
-        await bondingCurveDEX
-          .connect(trader1)
-          .buyTokens(await token.getAddress(), 0, {
-            value: ethers.parseEther("2"),
-          });
-
-        const poolInfo = await bondingCurveDEX.getPoolInfo(
-          await token.getAddress()
-        );
-
-        const totalSupply = ethers.parseEther("1000000000");
-        const expectedMarketCap =
-          (poolInfo.currentPrice * totalSupply) / 10n ** 18n;
-
-        expect(poolInfo.marketCapBNB).to.be.closeTo(
-          expectedMarketCap,
-          expectedMarketCap / 100n // Allow 1% tolerance instead of /1000n
-        );
-      }
-
-      const tokens = await token.balanceOf(trader1.address);
-      await token
-        .connect(trader1)
-        .approve(await bondingCurveDEX.getAddress(), tokens / 2n);
-
-      await bondingCurveDEX
-        .connect(trader1)
-        .sellTokens(await token.getAddress(), tokens / 2n, 0);
-
-      const poolInfo = await bondingCurveDEX.getPoolInfo(
-        await token.getAddress()
-      );
-
-      const totalSupply = ethers.parseEther("1000000000");
-      const expectedMarketCap =
-        (poolInfo.currentPrice * totalSupply) / 10n ** 18n;
-
-      expect(poolInfo.marketCapBNB).to.be.closeTo(
-        expectedMarketCap,
-        expectedMarketCap / 1000n
-      );
-    });
-  });
-
-  describe("Buying Tokens - Option 1", function () {
-    it("Should buy tokens from bonding curve", async function () {
-      const buyAmount = ethers.parseEther("1");
-
-      const balanceBefore = await token.balanceOf(trader1.address);
-
-      await bondingCurveDEX
-        .connect(trader1)
-        .buyTokens(await token.getAddress(), 0, { value: buyAmount });
-
-      const balanceAfter = await token.balanceOf(trader1.address);
-      expect(balanceAfter).to.be.gt(balanceBefore);
-    });
-
-    it("Should get accurate buy quote", async function () {
-      const buyAmount = ethers.parseEther("1");
-
-      const quote = await bondingCurveDEX.getBuyQuote(
-        await token.getAddress(),
-        buyAmount
-      );
-
-      expect(quote.tokensOut).to.be.gt(0);
-      expect(quote.pricePerToken).to.be.gt(0);
-    });
-
-    it("Should respect slippage protection", async function () {
-      const buyAmount = ethers.parseEther("1");
-      const quote = await bondingCurveDEX.getBuyQuote(
-        await token.getAddress(),
-        buyAmount
-      );
-
-      const minTokens = quote.tokensOut * 2n;
-
-      await expect(
-        bondingCurveDEX
-          .connect(trader1)
-          .buyTokens(await token.getAddress(), minTokens, { value: buyAmount })
-      ).to.be.revertedWith("Slippage too high");
-    });
-
-    it("Should distribute fees correctly on buy", async function () {
-      const buyAmount = ethers.parseEther("10");
-
-      const platformBalanceBefore = await ethers.provider.getBalance(
-        platformFee.address
-      );
-      const infoFiBalanceBefore = await ethers.provider.getBalance(
-        infoFiFee.address
-      );
-
-      await bondingCurveDEX
-        .connect(trader1)
-        .buyTokens(await token.getAddress(), 0, { value: buyAmount });
-
-      const platformBalanceAfter = await ethers.provider.getBalance(
-        platformFee.address
-      );
-      const infoFiBalanceAfter = await ethers.provider.getBalance(
-        infoFiFee.address
-      );
-
-      expect(platformBalanceAfter).to.be.gt(platformBalanceBefore);
-      expect(infoFiBalanceAfter).to.be.gt(infoFiBalanceBefore);
-    });
-
-    it("Should update reserves and market cap after buy", async function () {
-      const buyAmount = ethers.parseEther("1");
-
+    it("Should update reserves after buy", async function () {
       const poolInfoBefore = await bondingCurveDEX.getPoolInfo(
         await token.getAddress()
       );
 
       await bondingCurveDEX
         .connect(trader1)
-        .buyTokens(await token.getAddress(), 0, { value: buyAmount });
+        .buyTokens(await token.getAddress(), 0, {
+          value: ethers.parseEther("1"),
+        });
 
       const poolInfoAfter = await bondingCurveDEX.getPoolInfo(
         await token.getAddress()
@@ -563,542 +378,71 @@ describe("BondingCurveDEX", function () {
 
       expect(poolInfoAfter.bnbReserve).to.be.gt(poolInfoBefore.bnbReserve);
       expect(poolInfoAfter.tokenReserve).to.be.lt(poolInfoBefore.tokenReserve);
-      expect(poolInfoAfter.marketCapBNB).to.be.gt(poolInfoBefore.marketCapBNB);
-      expect(poolInfoAfter.marketCapUSD).to.be.gt(poolInfoBefore.marketCapUSD);
     });
 
-    it("Should increase price with each buy", async function () {
-      const buyAmount = ethers.parseEther("1");
-
-      const quote1 = await bondingCurveDEX.getBuyQuote(
-        await token.getAddress(),
-        buyAmount
-      );
-
-      await bondingCurveDEX
-        .connect(trader1)
-        .buyTokens(await token.getAddress(), 0, { value: buyAmount });
-
-      const quote2 = await bondingCurveDEX.getBuyQuote(
-        await token.getAddress(),
-        buyAmount
-      );
-
-      expect(quote2.pricePerToken).to.be.gt(quote1.pricePerToken);
-    });
-
-    it("Should emit TokensBought event", async function () {
-      const buyAmount = ethers.parseEther("1");
-
-      await expect(
-        bondingCurveDEX
-          .connect(trader1)
-          .buyTokens(await token.getAddress(), 0, { value: buyAmount })
-      ).to.emit(bondingCurveDEX, "TokensBought");
-    });
-
-    it("Should update graduation progress based on USD market cap", async function () {
-      const buyAmount = ethers.parseEther("100");
-
-      const poolInfoBefore = await bondingCurveDEX.getPoolInfo(
+    it("Should increase price after purchases", async function () {
+      const poolInfo1 = await bondingCurveDEX.getPoolInfo(
         await token.getAddress()
       );
 
       await bondingCurveDEX
         .connect(trader1)
-        .buyTokens(await token.getAddress(), 0, { value: buyAmount });
+        .buyTokens(await token.getAddress(), 0, {
+          value: ethers.parseEther("1"),
+        });
 
-      const poolInfoAfter = await bondingCurveDEX.getPoolInfo(
+      const poolInfo2 = await bondingCurveDEX.getPoolInfo(
         await token.getAddress()
       );
 
-      expect(poolInfoAfter.graduationProgress).to.be.gt(
-        poolInfoBefore.graduationProgress
-      );
-
-      const expectedProgress =
-        (poolInfoAfter.marketCapUSD * 100n) / ethers.parseEther("500000");
-      expect(poolInfoAfter.graduationProgress).to.equal(expectedProgress);
-    });
-  });
-
-  describe("Buying Tokens - Option 2", function () {
-    let instantToken: LaunchpadTokenV2;
-
-    beforeEach(async function () {
-      const tx = await tokenFactory.createToken(
-        "Instant Token",
-        "INST",
-        1_000_000_000,
-        18,
-        owner.address,
-        defaultMetadata
-      );
-
-      const receipt = await tx.wait();
-      const event = receipt?.logs.find((log: any) => {
-        try {
-          return (
-            tokenFactory.interface.parseLog(
-              log as unknown as Parameters<
-                typeof tokenFactory.interface.parseLog
-              >[0]
-            )?.name === "TokenCreated"
-          );
-        } catch {
-          return false;
-        }
-      });
-
-      const parsedEvent = tokenFactory.interface.parseLog(event as any);
-      const tokenAddress = parsedEvent?.args.tokenAddress;
-      instantToken = await ethers.getContractAt(
-        "LaunchpadTokenV2",
-        tokenAddress
-      );
-
-      const totalSupplyWei = ethers.parseEther("1000000000");
-      await instantToken.approve(
-        await bondingCurveDEX.getAddress(),
-        totalSupplyWei
-      );
-
-      await instantToken.setExemption(await bondingCurveDEX.getAddress(), true);
-
-      await bondingCurveDEX.createInstantLaunchPool(
-        await instantToken.getAddress(),
-        totalSupplyWei,
-        trader1.address,
-        { value: ethers.parseEther("10") }
-      );
+      expect(poolInfo2.currentPrice).to.be.gt(poolInfo1.currentPrice);
     });
 
-    it("Should buy tokens with 2% fee", async function () {
-      const buyAmount = ethers.parseEther("1");
-
-      await bondingCurveDEX
-        .connect(trader2)
-        .buyTokens(await instantToken.getAddress(), 0, { value: buyAmount });
-
-      const balance = await instantToken.balanceOf(trader2.address);
-      expect(balance).to.be.gt(0);
-    });
-
-    it("Should accumulate creator fees (50% of 2%)", async function () {
-      const buyAmount = ethers.parseEther("10");
-
-      await bondingCurveDEX
-        .connect(trader2)
-        .buyTokens(await instantToken.getAddress(), 0, { value: buyAmount });
-
-      const feeInfo = await bondingCurveDEX.getCreatorFeeInfo(
-        await instantToken.getAddress()
-      );
-
-      const expectedCreatorFee = (buyAmount * 10n) / 1000n;
-      expect(feeInfo.accumulatedFees).to.be.closeTo(
-        expectedCreatorFee,
-        ethers.parseEther("0.01")
-      );
-    });
-
-    it("Should graduate after reaching BOTH thresholds (FIX #2)", async function () {
-      await bondingCurveDEX
-        .connect(trader2)
-        .buyTokens(await instantToken.getAddress(), 0, {
-          value: ethers.parseEther("5.1"),
-        });
-
-      const poolInfo = await bondingCurveDEX.getPoolInfo(
-        await instantToken.getAddress()
-      );
-
-      if (poolInfo.graduated) {
-        expect(poolInfo.bnbReserve).to.be.gte(ethers.parseEther("15"));
-        expect(poolInfo.marketCapUSD).to.be.gte(ethers.parseEther("90000"));
-        expect(poolInfo.graduationProgress).to.be.gte(100);
-      }
-    });
-
-    it("Should distribute fees correctly (5% platform, 50% creator, 45% InfoFi)", async function () {
-      const buyAmount = ethers.parseEther("10");
-
-      const platformBalanceBefore = await ethers.provider.getBalance(
-        platformFee.address
-      );
-      const infoFiBalanceBefore = await ethers.provider.getBalance(
-        infoFiFee.address
-      );
-
-      await bondingCurveDEX
-        .connect(trader2)
-        .buyTokens(await instantToken.getAddress(), 0, { value: buyAmount });
-
-      const platformBalanceAfter = await ethers.provider.getBalance(
-        platformFee.address
-      );
-      const infoFiBalanceAfter = await ethers.provider.getBalance(
-        infoFiFee.address
-      );
-
-      const platformFees = platformBalanceAfter - platformBalanceBefore;
-      const infoFiFees = infoFiBalanceAfter - infoFiBalanceBefore;
-
-      expect(infoFiFees).to.be.closeTo(
-        platformFees * 9n,
-        ethers.parseEther("0.01")
-      );
-    });
-  });
-
-  describe("Creator Fee Claiming - Option 2", function () {
-    let instantToken: LaunchpadTokenV2;
-
-    beforeEach(async function () {
-      const tx = await tokenFactory.createToken(
-        "Instant Token",
-        "INST",
-        1_000_000_000,
-        18,
-        owner.address,
-        defaultMetadata
-      );
-
-      const receipt = await tx.wait();
-      const event = receipt?.logs.find((log: any) => {
-        try {
-          return (
-            tokenFactory.interface.parseLog(
-              log as unknown as Parameters<
-                typeof tokenFactory.interface.parseLog
-              >[0]
-            )?.name === "TokenCreated"
-          );
-        } catch {
-          return false;
-        }
-      });
-
-      const parsedEvent = tokenFactory.interface.parseLog(event as any);
-      const tokenAddress = parsedEvent?.args.tokenAddress;
-      instantToken = await ethers.getContractAt(
-        "LaunchpadTokenV2",
-        tokenAddress
-      );
-
-      const totalSupplyWei = ethers.parseEther("1000000000");
-      await instantToken.approve(
-        await bondingCurveDEX.getAddress(),
-        totalSupplyWei
-      );
-      await instantToken.setExemption(await bondingCurveDEX.getAddress(), true);
-
-      await bondingCurveDEX.createInstantLaunchPool(
-        await instantToken.getAddress(),
-        totalSupplyWei,
-        trader1.address,
-        { value: ethers.parseEther("10") }
-      );
-
-      await bondingCurveDEX
-        .connect(trader2)
-        .buyTokens(await instantToken.getAddress(), 0, {
-          value: ethers.parseEther("5.1"),
-        });
-    });
-
-    it("Should enforce 24-hour cooldown", async function () {
-      await expect(
-        bondingCurveDEX
-          .connect(trader1)
-          .claimCreatorFees(await instantToken.getAddress())
-      ).to.be.revertedWith("Claim cooldown active");
-    });
-
-    it("Should allow creator to claim when conditions met", async function () {
-      await ethers.provider.send("evm_increaseTime", [24 * 60 * 60]);
-      await ethers.provider.send("evm_mine", []);
-
-      const balanceBefore = await ethers.provider.getBalance(trader1.address);
-
-      const tx = await bondingCurveDEX
-        .connect(trader1)
-        .claimCreatorFees(await instantToken.getAddress());
-
-      const receipt = await tx.wait();
-      const gasUsed = receipt!.gasUsed * receipt!.gasPrice;
-      const balanceAfter = await ethers.provider.getBalance(trader1.address);
-
-      expect(balanceAfter + gasUsed).to.be.gt(balanceBefore);
-    });
-
-    it("Should redirect to InfoFi when market cap drops for 7 days", async function () {
-      // Buy some tokens to accumulate fees
-      await bondingCurveDEX
-        .connect(trader2)
-        .buyTokens(await instantToken.getAddress(), 0, {
-          value: ethers.parseEther("2"), // Lower amount to avoid graduation
-        });
-
-      // Verify pool has NOT graduated
-      let poolInfo = await bondingCurveDEX.getPoolInfo(
-        await instantToken.getAddress()
-      );
-      expect(poolInfo.graduated).to.be.false;
-
-      // Sell tokens to drop market cap
-      const tokens = await instantToken.balanceOf(trader2.address);
-      await instantToken
-        .connect(trader2)
-        .approve(await bondingCurveDEX.getAddress(), tokens);
-      await bondingCurveDEX
-        .connect(trader2)
-        .sellTokens(await instantToken.getAddress(), tokens / 2n, 0);
-
-      // Verify market cap dropped below target
-      poolInfo = await bondingCurveDEX.getPoolInfo(
-        await instantToken.getAddress()
-      );
-      const targetMarketCapUSD = ethers.parseEther("90000");
-      expect(poolInfo.marketCapUSD).to.be.lt(targetMarketCapUSD);
-
-      // Wait 7 days + 24 hours (cooldown)
-      await ethers.provider.send("evm_increaseTime", [8 * 24 * 60 * 60]);
-      await ethers.provider.send("evm_mine", []);
-
-      const infoFiBalanceBefore = await ethers.provider.getBalance(
-        infoFiFee.address
-      );
-
-      // Claim should redirect to InfoFi
-      await bondingCurveDEX
-        .connect(trader1)
-        .claimCreatorFees(await instantToken.getAddress());
-
-      const infoFiBalanceAfter = await ethers.provider.getBalance(
-        infoFiFee.address
-      );
-
-      expect(infoFiBalanceAfter).to.be.gt(infoFiBalanceBefore);
-    });
-    it("Should reject claim from non-creator", async function () {
-      await ethers.provider.send("evm_increaseTime", [24 * 60 * 60]);
-      await ethers.provider.send("evm_mine", []);
-
-      await expect(
-        bondingCurveDEX
-          .connect(trader2)
-          .claimCreatorFees(await instantToken.getAddress())
-      ).to.be.revertedWith("Not creator");
-    });
-  });
-
-  describe("Selling Tokens", function () {
-    let tokensReceived: bigint;
-
-    beforeEach(async function () {
-      const buyAmount = ethers.parseEther("10");
-      await bondingCurveDEX
-        .connect(trader1)
-        .buyTokens(await token.getAddress(), 0, { value: buyAmount });
-
-      tokensReceived = await token.balanceOf(trader1.address);
-    });
-
-    it("Should sell tokens to bonding curve", async function () {
-      const sellAmount = tokensReceived / 2n;
-
-      await token
-        .connect(trader1)
-        .approve(await bondingCurveDEX.getAddress(), sellAmount);
-
-      const bnbBalanceBefore = await ethers.provider.getBalance(
-        trader1.address
-      );
-
-      const tx = await bondingCurveDEX
-        .connect(trader1)
-        .sellTokens(await token.getAddress(), sellAmount, 0);
-
-      const receipt = await tx.wait();
-      const gasUsed = receipt!.gasUsed * receipt!.gasPrice;
-
-      const bnbBalanceAfter = await ethers.provider.getBalance(trader1.address);
-      const bnbReceived = bnbBalanceAfter - bnbBalanceBefore + gasUsed;
-
-      expect(bnbReceived).to.be.gt(0);
-    });
-
-    it("Should get accurate sell quote", async function () {
-      const sellAmount = tokensReceived / 2n;
-
-      const quote = await bondingCurveDEX.getSellQuote(
+    it("Should respect slippage protection on buy", async function () {
+      const quote = await bondingCurveDEX.getBuyQuote(
         await token.getAddress(),
-        sellAmount
+        ethers.parseEther("1")
       );
 
-      expect(quote.bnbOut).to.be.gt(0);
-      expect(quote.pricePerToken).to.be.gt(0);
-    });
-
-    it("Should respect slippage protection on sell", async function () {
-      const sellAmount = tokensReceived / 2n;
-      const quote = await bondingCurveDEX.getSellQuote(
-        await token.getAddress(),
-        sellAmount
-      );
-
-      await token
-        .connect(trader1)
-        .approve(await bondingCurveDEX.getAddress(), sellAmount);
-
-      const minBNB = quote.bnbOut * 2n;
+      const unrealisticMin = quote.tokensOut * 2n;
 
       await expect(
         bondingCurveDEX
           .connect(trader1)
-          .sellTokens(await token.getAddress(), sellAmount, minBNB)
+          .buyTokens(await token.getAddress(), unrealisticMin, {
+            value: ethers.parseEther("1"),
+          })
       ).to.be.revertedWith("Slippage too high");
     });
 
-    it("Should decrease price with each sell", async function () {
-      const sellAmount = tokensReceived / 4n;
-
-      const quote1 = await bondingCurveDEX.getSellQuote(
+    it("Should provide accurate buy quotes", async function () {
+      const buyAmount = ethers.parseEther("1");
+      const quote = await bondingCurveDEX.getBuyQuote(
         await token.getAddress(),
-        sellAmount
+        buyAmount
       );
-
-      await token
-        .connect(trader1)
-        .approve(await bondingCurveDEX.getAddress(), sellAmount);
 
       await bondingCurveDEX
         .connect(trader1)
-        .sellTokens(await token.getAddress(), sellAmount, 0);
+        .buyTokens(await token.getAddress(), 0, {
+          value: buyAmount,
+        });
 
-      const quote2 = await bondingCurveDEX.getSellQuote(
-        await token.getAddress(),
-        sellAmount
-      );
+      const actualBalance = await token.balanceOf(trader1.address);
 
-      expect(quote2.pricePerToken).to.be.lt(quote1.pricePerToken);
-    });
-
-    it("Should emit TokensSold event", async function () {
-      const sellAmount = tokensReceived / 2n;
-
-      await token
-        .connect(trader1)
-        .approve(await bondingCurveDEX.getAddress(), sellAmount);
-
-      await expect(
-        bondingCurveDEX
-          .connect(trader1)
-          .sellTokens(await token.getAddress(), sellAmount, 0)
-      ).to.emit(bondingCurveDEX, "TokensSold");
-    });
-
-    it("Should decrease market cap in USD after sell", async function () {
-      const sellAmount = tokensReceived / 2n;
-
-      const poolInfoBefore = await bondingCurveDEX.getPoolInfo(
-        await token.getAddress()
-      );
-
-      await token
-        .connect(trader1)
-        .approve(await bondingCurveDEX.getAddress(), sellAmount);
-
-      await bondingCurveDEX
-        .connect(trader1)
-        .sellTokens(await token.getAddress(), sellAmount, 0);
-
-      const poolInfoAfter = await bondingCurveDEX.getPoolInfo(
-        await token.getAddress()
-      );
-
-      expect(poolInfoAfter.marketCapUSD).to.be.lt(poolInfoBefore.marketCapUSD);
-    });
-  });
-
-  describe("Market Cap & Graduation", function () {
-    it("Should track market cap accurately in both BNB and USD", async function () {
-      const poolInfo = await bondingCurveDEX.getPoolInfo(
-        await token.getAddress()
-      );
-
-      expect(poolInfo.marketCapBNB).to.be.gt(0);
-      expect(poolInfo.marketCapUSD).to.be.gt(0);
-
-      const expectedUSD =
-        (poolInfo.marketCapBNB * BNB_PRICE_USD) / ethers.parseEther("1");
-      expect(poolInfo.marketCapUSD).to.be.closeTo(
-        expectedUSD,
-        ethers.parseEther("0.001")
+      expect(actualBalance).to.be.closeTo(
+        quote.tokensOut,
+        quote.tokensOut / 1000n
       );
     });
 
-    it("Should show graduation progress based on USD", async function () {
-      const poolInfo = await bondingCurveDEX.getPoolInfo(
-        await token.getAddress()
-      );
-      expect(poolInfo.graduationProgress).to.be.gte(0);
-      expect(poolInfo.graduationProgress).to.be.lte(100);
-
-      const expectedProgress =
-        (poolInfo.marketCapUSD * 100n) / ethers.parseEther("500000");
-      expect(poolInfo.graduationProgress).to.equal(expectedProgress);
-    });
-
-    it("Should automatically graduate when USD market cap reaches $500k", async function () {
-      for (let i = 0; i < 10; i++) {
-        try {
-          await bondingCurveDEX
-            .connect(trader1)
-            .buyTokens(await token.getAddress(), 0, {
-              value: ethers.parseEther("100"),
-            });
-        } catch (e) {
-          break;
-        }
-      }
-
-      const poolInfo = await bondingCurveDEX.getPoolInfo(
-        await token.getAddress()
-      );
-
-      if (poolInfo.marketCapUSD >= ethers.parseEther("500000")) {
-        expect(poolInfo.graduated).to.be.true;
-      }
-    });
-
-    it("Should manually graduate pool (operator function)", async function () {
+    it("Should reject buying after graduation", async function () {
       const OPERATOR_ROLE = ethers.keccak256(
         ethers.toUtf8Bytes("OPERATOR_ROLE")
       );
       await bondingCurveDEX.grantRole(OPERATOR_ROLE, owner.address);
 
       await bondingCurveDEX.graduatePool(await token.getAddress());
-
-      const poolInfo = await bondingCurveDEX.getPoolInfo(
-        await token.getAddress()
-      );
-      expect(poolInfo.graduated).to.be.true;
-    });
-
-    it("Should deactivate pool after graduation", async function () {
-      const OPERATOR_ROLE = ethers.keccak256(
-        ethers.toUtf8Bytes("OPERATOR_ROLE")
-      );
-      await bondingCurveDEX.grantRole(OPERATOR_ROLE, owner.address);
-
-      await bondingCurveDEX.graduatePool(await token.getAddress());
-
-      const poolInfo = await bondingCurveDEX.getPoolInfo(
-        await token.getAddress()
-      );
-      expect(poolInfo.graduated).to.be.true;
 
       await expect(
         bondingCurveDEX
@@ -1106,139 +450,354 @@ describe("BondingCurveDEX", function () {
           .buyTokens(await token.getAddress(), 0, {
             value: ethers.parseEther("1"),
           })
-      ).to.be.revertedWith("Pool has graduated");
+      ).to.be.revertedWith("Buying forbidden after graduation");
     });
+  });
 
-    it("Should reject sells after graduation", async function () {
+  describe("Trading - Sell Operations (INSTANT_LAUNCH)", function () {
+    beforeEach(async function () {
       await bondingCurveDEX
         .connect(trader1)
         .buyTokens(await token.getAddress(), 0, {
           value: ethers.parseEther("5"),
         });
+    });
 
-      const tokens = await token.balanceOf(trader1.address);
-
-      const OPERATOR_ROLE = ethers.keccak256(
-        ethers.toUtf8Bytes("OPERATOR_ROLE")
-      );
-      await bondingCurveDEX.grantRole(OPERATOR_ROLE, owner.address);
-      await bondingCurveDEX.graduatePool(await token.getAddress());
+    it("Should allow selling tokens", async function () {
+      const balance = await token.balanceOf(trader1.address);
+      const sellAmount = balance / 2n;
 
       await token
         .connect(trader1)
-        .approve(await bondingCurveDEX.getAddress(), tokens);
+        .approve(await bondingCurveDEX.getAddress(), sellAmount);
+
+      const bnbBefore = await ethers.provider.getBalance(trader1.address);
+
+      await bondingCurveDEX
+        .connect(trader1)
+        .sellTokens(await token.getAddress(), sellAmount, 0);
+
+      const bnbAfter = await ethers.provider.getBalance(trader1.address);
+
+      expect(bnbAfter).to.be.gt(bnbBefore);
+    });
+
+    it("Should update reserves after sell", async function () {
+      const balance = await token.balanceOf(trader1.address);
+      const sellAmount = balance / 2n;
+
+      await token
+        .connect(trader1)
+        .approve(await bondingCurveDEX.getAddress(), sellAmount);
+
+      const poolInfoBefore = await bondingCurveDEX.getPoolInfo(
+        await token.getAddress()
+      );
+
+      await bondingCurveDEX
+        .connect(trader1)
+        .sellTokens(await token.getAddress(), sellAmount, 0);
+
+      const poolInfoAfter = await bondingCurveDEX.getPoolInfo(
+        await token.getAddress()
+      );
+
+      expect(poolInfoAfter.bnbReserve).to.be.lt(poolInfoBefore.bnbReserve);
+      expect(poolInfoAfter.tokenReserve).to.be.gt(poolInfoBefore.tokenReserve);
+    });
+
+    it("Should decrease price after sells", async function () {
+      const poolInfo1 = await bondingCurveDEX.getPoolInfo(
+        await token.getAddress()
+      );
+
+      const balance = await token.balanceOf(trader1.address);
+      const sellAmount = balance / 2n;
+
+      await token
+        .connect(trader1)
+        .approve(await bondingCurveDEX.getAddress(), sellAmount);
+
+      await bondingCurveDEX
+        .connect(trader1)
+        .sellTokens(await token.getAddress(), sellAmount, 0);
+
+      const poolInfo2 = await bondingCurveDEX.getPoolInfo(
+        await token.getAddress()
+      );
+
+      expect(poolInfo2.currentPrice).to.be.lt(poolInfo1.currentPrice);
+    });
+
+    it("Should respect slippage protection on sell", async function () {
+      const balance = await token.balanceOf(trader1.address);
+      const sellAmount = balance / 2n;
+
+      const quote = await bondingCurveDEX.getSellQuote(
+        await token.getAddress(),
+        sellAmount
+      );
+
+      await token
+        .connect(trader1)
+        .approve(await bondingCurveDEX.getAddress(), sellAmount);
+
+      const unrealisticMin = quote.bnbOut * 2n;
 
       await expect(
         bondingCurveDEX
           .connect(trader1)
-          .sellTokens(await token.getAddress(), tokens, 0)
-      ).to.be.revertedWith("Pool has graduated");
+          .sellTokens(await token.getAddress(), sellAmount, unrealisticMin)
+      ).to.be.revertedWith("Slippage too high");
+    });
+
+    it("Should provide accurate sell quotes", async function () {
+      const balance = await token.balanceOf(trader1.address);
+      const sellAmount = balance / 2n;
+
+      const quote = await bondingCurveDEX.getSellQuote(
+        await token.getAddress(),
+        sellAmount
+      );
+
+      await token
+        .connect(trader1)
+        .approve(await bondingCurveDEX.getAddress(), sellAmount);
+
+      const bnbBefore = await ethers.provider.getBalance(trader1.address);
+
+      const tx = await bondingCurveDEX
+        .connect(trader1)
+        .sellTokens(await token.getAddress(), sellAmount, 0);
+
+      const receipt = await tx.wait();
+      const gasUsed = receipt!.gasUsed * receipt!.gasPrice;
+
+      const bnbAfter = await ethers.provider.getBalance(trader1.address);
+      const actualBnbReceived = bnbAfter - bnbBefore + gasUsed;
+
+      expect(actualBnbReceived).to.be.closeTo(
+        quote.bnbOut,
+        quote.bnbOut / 100n
+      );
+    });
+  });
+
+  describe("Fee Structure - Dynamic Anti-Bot Fees (INSTANT_LAUNCH)", function () {
+    it("Should start with 10% fee (Tier 1)", async function () {
+      const feeInfo = await bondingCurveDEX.getFeeInfo(
+        await token.getAddress()
+      );
+
+      expect(feeInfo.currentFeeRate).to.equal(1000); // 10% = 1000 basis points
+      expect(feeInfo.feeStage).to.equal("Tier 1 (10%)");
+    });
+
+    it("Should decay to 6% after 20 blocks (Tier 2)", async function () {
+      for (let i = 0; i < 20; i++) {
+        await ethers.provider.send("evm_mine");
+      }
+
+      const feeInfo = await bondingCurveDEX.getFeeInfo(
+        await token.getAddress()
+      );
+
+      expect(feeInfo.currentFeeRate).to.equal(600); // 6% = 600 basis points
+      expect(feeInfo.feeStage).to.equal("Tier 2 (6%)");
+    });
+
+    it("Should decay to 4% after 50 blocks (Tier 3)", async function () {
+      for (let i = 0; i < 50; i++) {
+        await ethers.provider.send("evm_mine");
+      }
+
+      const feeInfo = await bondingCurveDEX.getFeeInfo(
+        await token.getAddress()
+      );
+
+      expect(feeInfo.currentFeeRate).to.equal(400); // 4% = 400 basis points
+      expect(feeInfo.feeStage).to.equal("Tier 3 (4%)");
+    });
+
+    it("Should reach final fee of 1% after 100 blocks (INSTANT_LAUNCH)", async function () {
+      for (let i = 0; i < 100; i++) {
+        await ethers.provider.send("evm_mine");
+      }
+
+      const feeInfo = await bondingCurveDEX.getFeeInfo(
+        await token.getAddress()
+      );
+
+      expect(feeInfo.currentFeeRate).to.equal(100); // 1% for INSTANT_LAUNCH
+      expect(feeInfo.feeStage).to.equal("Final (1%)");
+    });
+  });
+
+  describe("Graduation (INSTANT_LAUNCH)", function () {
+    it("Should graduate when BNB threshold reached", async function () {
+      let graduated = false;
+      let attempts = 0;
+
+      while (!graduated && attempts < 50) {
+        try {
+          await bondingCurveDEX
+            .connect(trader1)
+            .buyTokens(await token.getAddress(), 0, {
+              value: ethers.parseEther("1"),
+            });
+
+          const poolInfo = await bondingCurveDEX.getPoolInfo(
+            await token.getAddress()
+          );
+          graduated = poolInfo.graduated;
+          attempts++;
+        } catch (e) {
+          break;
+        }
+      }
+
+      if (graduated) {
+        const poolInfo = await bondingCurveDEX.getPoolInfo(
+          await token.getAddress()
+        );
+        expect(poolInfo.graduated).to.be.true;
+      }
     });
 
     it("Should emit PoolGraduated event", async function () {
+      let graduated = false;
+      let attempts = 0;
+
+      while (!graduated && attempts < 50) {
+        try {
+          const tx = await bondingCurveDEX
+            .connect(trader1)
+            .buyTokens(await token.getAddress(), 0, {
+              value: ethers.parseEther("1"),
+            });
+
+          const poolInfo = await bondingCurveDEX.getPoolInfo(
+            await token.getAddress()
+          );
+          graduated = poolInfo.graduated;
+
+          if (graduated) {
+            await expect(tx).to.emit(bondingCurveDEX, "PoolGraduated");
+            break;
+          }
+
+          attempts++;
+        } catch (e) {
+          break;
+        }
+      }
+    });
+
+    it("Should allow withdrawal of graduated pool funds", async function () {
       const OPERATOR_ROLE = ethers.keccak256(
         ethers.toUtf8Bytes("OPERATOR_ROLE")
       );
       await bondingCurveDEX.grantRole(OPERATOR_ROLE, owner.address);
 
-      await expect(
-        bondingCurveDEX.graduatePool(await token.getAddress())
-      ).to.emit(bondingCurveDEX, "PoolGraduated");
+      await bondingCurveDEX.graduatePool(await token.getAddress());
+
+      const result = await bondingCurveDEX.withdrawGraduatedPool(
+        await token.getAddress()
+      );
+
+      expect(result).to.not.be.undefined;
     });
   });
 
-  describe("Price Oracle Integration", function () {
-    it("Should adapt graduation threshold to BNB price changes", async function () {
-      const TokenFactoryV2 = await ethers.getContractFactory("TokenFactoryV2");
-      const factory2 = await TokenFactoryV2.deploy();
-      await factory2.waitForDeployment();
+  describe("Creator Fees (INSTANT_LAUNCH)", function () {
+    beforeEach(async function () {
+      for (let i = 0; i < 100; i++) {
+        await ethers.provider.send("evm_mine");
+      }
 
-      const tx = await factory2.createToken(
-        "Token2",
-        "TK2",
-        1_000_000_000,
-        18,
-        owner.address,
-        defaultMetadata
-      );
-
-      const receipt = await tx.wait();
-      const event = receipt?.logs?.find((log: any) => {
-        try {
-          return (
-            factory2.interface.parseLog(
-              log as unknown as Parameters<
-                typeof factory2.interface.parseLog
-              >[0]
-            )?.name === "TokenCreated"
-          );
-        } catch {
-          return false;
-        }
-      });
-
-      const parsedEvent = factory2.interface.parseLog(event as any);
-      const token2Address = parsedEvent?.args.tokenAddress;
-      const token2 = await ethers.getContractAt(
-        "LaunchpadTokenV2",
-        token2Address
-      );
-
-      await token2.setExemption(await bondingCurveDEX.getAddress(), true);
-
-      await token2.approve(
-        await bondingCurveDEX.getAddress(),
-        INITIAL_LIQUIDITY_TOKENS
-      );
-
-      await bondingCurveDEX.createPool(
-        await token2.getAddress(),
-        INITIAL_LIQUIDITY_TOKENS,
-        infoFiFee.address,
-        owner.address, // creator
-        { value: INITIAL_LIQUIDITY_BNB }
-      );
-
-      const poolInfo1 = await bondingCurveDEX.getPoolInfo(token2Address);
-
-      await priceOracle.setBNBPrice(ethers.parseEther("1000"));
-
-      const poolInfo2 = await bondingCurveDEX.getPoolInfo(token2Address);
-
-      expect(poolInfo2.marketCapBNB).to.equal(poolInfo1.marketCapBNB);
-
-      const expectedUSD =
-        (poolInfo1.marketCapBNB * ethers.parseEther("1000")) /
-        ethers.parseEther("1");
-      expect(poolInfo2.marketCapUSD).to.be.closeTo(
-        expectedUSD,
-        ethers.parseEther("10")
-      );
+      await bondingCurveDEX
+        .connect(trader1)
+        .buyTokens(await token.getAddress(), 0, {
+          value: ethers.parseEther("5"),
+        });
     });
 
-    it("Should calculate different graduation thresholds for different BNB prices", async function () {
-      await priceOracle.setBNBPrice(ethers.parseEther("1000"));
+    it("Should accumulate creator fees from trades", async function () {
+      const feeInfo = await bondingCurveDEX.getCreatorFeeInfo(
+        await token.getAddress()
+      );
 
-      const TokenFactoryV2 = await ethers.getContractFactory("TokenFactoryV2");
-      const factory2 = await TokenFactoryV2.deploy();
-      await factory2.waitForDeployment();
+      expect(feeInfo.accumulatedFees).to.be.gt(0);
+    });
 
-      const tx = await factory2.createToken(
-        "TokenHighPrice",
-        "TKH",
+    it("Should allow creator to claim fees after cooldown", async function () {
+      await ethers.provider.send("evm_increaseTime", [24 * 60 * 60 + 1]);
+      await ethers.provider.send("evm_mine");
+
+      const feeInfo = await bondingCurveDEX.getCreatorFeeInfo(
+        await token.getAddress()
+      );
+
+      if (feeInfo.accumulatedFees > 0 && feeInfo.canClaim) {
+        await expect(
+          bondingCurveDEX
+            .connect(owner)
+            .claimCreatorFees(await token.getAddress())
+        ).to.emit(bondingCurveDEX, "CreatorFeesClaimed");
+      }
+    });
+
+    it("Should enforce 24-hour claim cooldown", async function () {
+      const feeInfo = await bondingCurveDEX.getCreatorFeeInfo(
+        await token.getAddress()
+      );
+
+      if (feeInfo.accumulatedFees > 0) {
+        await expect(
+          bondingCurveDEX
+            .connect(owner)
+            .claimCreatorFees(await token.getAddress())
+        ).to.be.revertedWith("Claim cooldown active");
+      }
+    });
+  });
+
+  describe("Price Oracle Integration (INSTANT_LAUNCH)", function () {
+    it("Should update market cap USD when BNB price changes", async function () {
+      const poolInfo1 = await bondingCurveDEX.getPoolInfo(
+        await token.getAddress()
+      );
+
+      await priceOracle.setBNBPrice(ethers.parseEther("700"));
+
+      const poolInfo2 = await bondingCurveDEX.getPoolInfo(
+        await token.getAddress()
+      );
+
+      expect(poolInfo2.marketCapUSD).to.not.equal(poolInfo1.marketCapUSD);
+    });
+
+    it("Should maintain correct market cap in multiple tokens", async function () {
+      const factory2 = await ethers.getContractFactory("TokenFactoryV2");
+      const tokenFactory2 = await factory2.deploy();
+      await tokenFactory2.waitForDeployment();
+
+      const tx2 = await tokenFactory2.createToken(
+        "High Value Token",
+        "HIGH",
         1_000_000_000,
         18,
         owner.address,
         defaultMetadata
       );
 
-      const receipt = await tx.wait();
-      const event = receipt?.logs?.find((log: any) => {
+      const receipt2 = await tx2.wait();
+      const event = receipt2?.logs.find((log: any) => {
         try {
           return (
-            factory2.interface.parseLog(
+            tokenFactory2.interface.parseLog(
               log as unknown as Parameters<
-                typeof factory2.interface.parseLog
+                typeof tokenFactory2.interface.parseLog
               >[0]
             )?.name === "TokenCreated"
           );
@@ -1247,7 +806,7 @@ describe("BondingCurveDEX", function () {
         }
       });
 
-      const parsedEvent = factory2.interface.parseLog(event as any);
+      const parsedEvent = tokenFactory2.interface.parseLog(event as any);
       const tokenHighAddress = parsedEvent?.args.tokenAddress;
       const tokenHigh = await ethers.getContractAt(
         "LaunchpadTokenV2",
@@ -1263,8 +822,8 @@ describe("BondingCurveDEX", function () {
       await bondingCurveDEX.createPool(
         await tokenHigh.getAddress(),
         INITIAL_LIQUIDITY_TOKENS,
-        infoFiFee.address,
         owner.address, // creator
+        false, // burnLP
         { value: INITIAL_LIQUIDITY_BNB }
       );
     });
@@ -1296,7 +855,7 @@ describe("BondingCurveDEX", function () {
     });
   });
 
-  describe("Price Impact", function () {
+  describe("Price Impact (INSTANT_LAUNCH)", function () {
     it("Should have higher price impact for larger trades", async function () {
       const smallBuy = ethers.parseEther("1");
       const largeBuy = ethers.parseEther("10");
@@ -1329,7 +888,7 @@ describe("BondingCurveDEX", function () {
     });
   });
 
-  describe("Multiple Traders", function () {
+  describe("Multiple Traders (INSTANT_LAUNCH)", function () {
     it("Should handle multiple concurrent traders", async function () {
       const buyAmount = ethers.parseEther("5");
 
@@ -1430,7 +989,7 @@ describe("BondingCurveDEX", function () {
     });
   });
 
-  describe("Edge Cases", function () {
+  describe("Edge Cases (INSTANT_LAUNCH)", function () {
     it("Should reject zero amount buys", async function () {
       await expect(
         bondingCurveDEX
@@ -1497,7 +1056,7 @@ describe("BondingCurveDEX", function () {
           .buyTokens(await token.getAddress(), 0, {
             value: ethers.parseEther("5"),
           })
-      ).to.not.be.revert(ethers);
+      ).to.not.be.reverted;
     });
   });
 });

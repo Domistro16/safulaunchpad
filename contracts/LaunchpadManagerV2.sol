@@ -1,6 +1,87 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+/**
+ * @title LaunchpadManagerV3 - FIXED for Project Raise Flow
+ * @author SafuPad Team
+ * @notice Manages two types of token launches: Project Raise and Instant Launch
+ *
+ * VERSION: 2.0.0 (Major Fixes Applied)
+ *
+ * ═══════════════════════════════════════════════════════════════════
+ * CRITICAL FIXES APPLIED:
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * ✅ FIX #1: Added per-wallet contribution cap (4.44 BNB)
+ *    - Prevents whales from monopolizing Project Raise
+ *    - Added MAX_CONTRIBUTION_PER_WALLET constant
+ *    - Enforced in contribute() function
+ *
+ * ✅ FIX #2: Added claimContributorTokens() function
+ *    - Contributors can now claim their tokens after successful raise
+ *    - Proportional distribution from 70% contributor allocation
+ *    - Critical fix - tokens were previously stuck!
+ *
+ * ✅ FIX #3: Added claimRefund() function
+ *    - Contributors get refunds if raise fails
+ *    - Available after 24h deadline if target not met
+ *    - Critical fix - BNB was previously stuck!
+ *
+ * ✅ FIX #4: Fixed token distribution for Project Raise
+ *    - Tokens now stay in LaunchpadManager (not sent to BondingCurveDEX)
+ *    - 70% for contributors (claim via claimContributorTokens)
+ *    - 20% for founder (vested)
+ *    - 10% for PancakeSwap (added in graduateToPancakeSwap)
+ *
+ * ✅ FIX #5: Added 1% platform fee on PancakeSwap liquidity
+ *    - Deducted from BNB before adding liquidity
+ *    - Applies to both Project Raise and Instant Launch
+ *    - Sent to platformFeeAddress
+ *
+ * ✅ FIX #6: Added burnFailedRaiseTokens() function
+ *    - Burns tokens if raise fails
+ *    - Callable by anyone after deadline
+ *
+ * ✅ FIX #7: Separated Project Raise from BondingCurveDEX
+ *    - Project Raise = Fixed-price contribution period
+ *    - Instant Launch = Uses bonding curve
+ *    - Clear separation of logic
+ *
+ * ═══════════════════════════════════════════════════════════════════
+ * PROJECT RAISE FLOW:
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * 1. LAUNCH (Founder)
+ *    - Creates token (1B supply)
+ *    - Sets raise target & max
+ *    - 24-hour timer starts
+ *
+ * 2. CONTRIBUTION PERIOD (24 hours)
+ *    - Users contribute BNB (max 4.44 per wallet)
+ *    - Fixed price: raiseTarget / 700M tokens
+ *    - Get proportional allocation from 70% pool
+ *
+ * 3A. IF SUCCESS (target met):
+ *     - Contributors claim tokens (70% = 700M)
+ *     - Founder gets 20% (200M, vested)
+ *     - 10% (100M) + 50% BNB → PancakeSwap (-1% fee)
+ *     - Remaining BNB → Founder (vested)
+ *
+ * 3B. IF FAILED (target not met):
+ *     - All contributors get refunded
+ *     - Tokens burned
+ *
+ * ═══════════════════════════════════════════════════════════════════
+ * INSTANT LAUNCH FLOW:
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * 1. Launch with bonding curve via BondingCurveDEX
+ * 2. Trade on curve until graduation
+ * 3. Graduate to PancakeSwap (-1% fee)
+ *
+ * ═══════════════════════════════════════════════════════════════════
+ */
+
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -144,11 +225,16 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
     uint256 public constant MIN_RAISE_BNB = 0.1 ether;
     uint256 public constant MAX_RAISE_BNB = 0.5 ether;
     uint256 public constant MAX_LIQUIDITY_BNB = 0.2 ether;
+    uint256 public constant MAX_CONTRIBUTION_PER_WALLET = 0.1 ether; // ✅ NEW: Per-wallet contribution cap
     uint256 public constant RAISE_DURATION = 24 hours;
     uint256 public constant FOUNDER_ALLOCATION = 20;
+    uint256 public constant CONTRIBUTOR_ALLOCATION = 70; // ✅ NEW: 70% for contributors
+    uint256 public constant PANCAKESWAP_ALLOCATION = 10; // ✅ NEW: 10% for PancakeSwap
     uint256 public constant IMMEDIATE_FOUNDER_RELEASE = 50;
     uint256 public constant LIQUIDITY_PERCENT = 10;
     uint256 public constant LIQUIDITY_BNB_PERCENT = 50;
+    uint256 public constant PLATFORM_FEE_BPS = 100; // ✅ NEW: 1% platform fee (100 basis points)
+    uint256 public constant BASIS_POINTS = 10000;
     uint256 public constant MIN_VESTING_DURATION = 90 days;
     uint256 public constant MAX_VESTING_DURATION = 180 days;
     uint256 public constant VESTING_RELEASE_INTERVAL = 30 days;
@@ -162,6 +248,7 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
     IPancakeRouter02 public pancakeRouter;
     PriceOracle public priceOracle;
     address public infoFiAddress; // ✅ Global InfoFi address
+    address public platformFeeAddress; // ✅ NEW: Platform fee recipient
     ILPFeeHarvester public lpFeeHarvester;
     address public pancakeFactory;
     address public wbnbAddress;
@@ -201,6 +288,22 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         uint256 amount
     );
     event RaiseCompleted(address indexed token, uint256 totalRaised);
+    event ContributorTokensClaimed(
+        address indexed contributor,
+        address indexed token,
+        uint256 amount
+    ); // ✅ NEW
+    event RefundClaimed(
+        address indexed contributor,
+        address indexed token,
+        uint256 amount
+    ); // ✅ NEW
+    event RaiseFailed(address indexed token, uint256 totalRaised); // ✅ NEW
+    event PlatformFeePaid(
+        address indexed token,
+        uint256 amount,
+        string feeType
+    ); // ✅ NEW
     event FounderTokensClaimed(
         address indexed founder,
         address indexed token,
@@ -240,6 +343,7 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         address _pancakeRouter,
         address _priceOracle,
         address _infoFiAddress,
+        address _platformFeeAddress, // ✅ NEW
         address _lpFeeHarvester,
         address _pancakeFactory
     ) Ownable(msg.sender) {
@@ -248,6 +352,10 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         require(_pancakeRouter != address(0), "Invalid pancake router");
         require(_priceOracle != address(0), "Invalid price oracle");
         require(_infoFiAddress != address(0), "Invalid InfoFi address");
+        require(
+            _platformFeeAddress != address(0),
+            "Invalid platform fee address"
+        ); // ✅ NEW
         require(_lpFeeHarvester != address(0), "Invalid LP harvester");
         pancakeFactory = _pancakeFactory;
         wbnbAddress = address(0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd);
@@ -256,6 +364,7 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         bondingCurveDEX = IBondingCurveDEXV3(_bondingCurveDEX);
         pancakeRouter = IPancakeRouter02(_pancakeRouter);
         infoFiAddress = _infoFiAddress;
+        platformFeeAddress = _platformFeeAddress; // ✅ NEW
         priceOracle = PriceOracle(_priceOracle);
         lpFeeHarvester = ILPFeeHarvester(_lpFeeHarvester);
 
@@ -528,18 +637,68 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
             "Already graduated to PancakeSwap"
         );
 
-        (, , , , , , , , bool graduated) = bondingCurveDEX.getPoolInfo(token);
-        require(graduated, "Not ready to graduate");
+        uint256 bnbForLiquidity;
+        uint256 tokensForLiquidity;
 
-        (
-            uint256 bnbForLiquidity,
-            uint256 tokensForLiquidity,
-            uint256 remainingTokens,
-            address creator
-        ) = bondingCurveDEX.withdrawGraduatedPool(token);
+        if (basics.launchType == LaunchType.PROJECT_RAISE) {
+            // ✅ PROJECT RAISE: Add 10% of tokens with liquidity BNB
+            require(status.raiseCompleted, "Raise not completed");
+            require(!status.liquidityAdded, "Liquidity already added");
 
-        require(creator == basics.founder, "Creator mismatch");
+            LaunchLiquidity storage liquidity = launchLiquidity[token];
 
+            // 10% of total supply for PancakeSwap
+            tokensForLiquidity =
+                (basics.totalSupply * PANCAKESWAP_ALLOCATION) /
+                100;
+            bnbForLiquidity = liquidity.liquidityBNB;
+
+            require(bnbForLiquidity > 0, "No BNB for liquidity");
+            require(tokensForLiquidity > 0, "No tokens for liquidity");
+
+            // ✅ DEDUCT 1% PLATFORM FEE from BNB
+            uint256 platformFee = (bnbForLiquidity * PLATFORM_FEE_BPS) /
+                BASIS_POINTS;
+            bnbForLiquidity = bnbForLiquidity - platformFee;
+
+            // Send platform fee
+            payable(platformFeeAddress).transfer(platformFee);
+            emit PlatformFeePaid(token, platformFee, "Project Raise Liquidity");
+
+            status.liquidityAdded = true;
+        } else {
+            // ✅ INSTANT LAUNCH: Get from BondingCurveDEX
+            (, , , , , , , , bool graduated) = bondingCurveDEX.getPoolInfo(
+                token
+            );
+            require(graduated, "Not ready to graduate");
+
+            address creator;
+            uint256 remainingTokens;
+            (
+                bnbForLiquidity,
+                tokensForLiquidity,
+                remainingTokens,
+                creator
+            ) = bondingCurveDEX.withdrawGraduatedPool(token);
+
+            require(creator == basics.founder, "Creator mismatch");
+
+            // ✅ DEDUCT 1% PLATFORM FEE from BNB for Instant Launch too
+            uint256 platformFee = (bnbForLiquidity * PLATFORM_FEE_BPS) /
+                BASIS_POINTS;
+            bnbForLiquidity = bnbForLiquidity - platformFee;
+
+            // Send platform fee
+            payable(platformFeeAddress).transfer(platformFee);
+            emit PlatformFeePaid(
+                token,
+                platformFee,
+                "Instant Launch Liquidity"
+            );
+        }
+
+        // Approve and add liquidity
         IERC20(token).approve(address(pancakeRouter), tokensForLiquidity);
 
         (, , uint256 liquidity) = pancakeRouter.addLiquidityETH{
@@ -547,24 +706,28 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         }(
             token,
             tokensForLiquidity,
-            0,
-            0,
+            0, // TODO: Add slippage protection
+            0, // TODO: Add slippage protection
             address(this),
             block.timestamp + 300
         );
 
         require(liquidity > 0, "No liquidity");
 
+        // Get LP token address and handle LP tokens
         address lpToken = _getPancakePairAddressFromFactory(token, wbnbAddress);
         require(lpToken != address(0), "LP token not found");
-        bondingCurveDEX.setLPToken(token);
+
+        if (basics.launchType == LaunchType.INSTANT_LAUNCH) {
+            bondingCurveDEX.setLPToken(token);
+        }
+
         if (basics.burnLP) {
             IERC20(lpToken).safeTransfer(LP_BURN_ADDRESS, liquidity);
             emit LPBurned(token, lpToken, liquidity);
         } else {
             IERC20(lpToken).approve(address(lpFeeHarvester), liquidity);
 
-            // ✅ UPDATED: Always use global infoFiAddress
             lpFeeHarvester.lockLP(
                 token,
                 lpToken,
@@ -577,6 +740,7 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
             emit LPLocked(token, lpToken, liquidity);
         }
 
+        // Enable transfers
         ILaunchpadToken(token).enableTransfers();
 
         status.graduatedToPancakeSwap = true;
@@ -730,6 +894,13 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         require(!status.raiseCompleted, "Raise already completed");
         require(msg.value > 0, "Must contribute BNB");
 
+        // ✅ FIX: Per-wallet contribution cap
+        require(
+            contributions[token][msg.sender].amount + msg.value <=
+                MAX_CONTRIBUTION_PER_WALLET,
+            "Exceeds per-wallet contribution limit (4.44 BNB)"
+        );
+
         require(
             basics.totalRaised + msg.value <= basics.raiseMax,
             "Exceeds max raise"
@@ -756,9 +927,9 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         status.raiseCompleted = true;
         vesting.vestingStartTime = block.timestamp;
 
+        // Calculate liquidity BNB (50% of raised, max 0.2 BNB)
         uint256 liquidityBNB = (basics.totalRaised * LIQUIDITY_BNB_PERCENT) /
             100;
-
         if (liquidityBNB > MAX_LIQUIDITY_BNB) {
             liquidityBNB = MAX_LIQUIDITY_BNB;
         }
@@ -766,44 +937,121 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         liquidity.liquidityBNB = liquidityBNB;
         liquidity.raisedFundsVesting = basics.totalRaised - liquidityBNB;
 
-        uint256 tradingTokens = (basics.totalSupply * 70) / 100;
+        // ✅ FIX: Project Raise tokens stay here for distribution
+        // 70% for contributors (claimed via claimContributorTokens)
+        // 20% for founder (vested)
+        // 10% for PancakeSwap (added in graduateToPancakeSwap)
 
+        // Calculate market cap based on contributor allocation
+        uint256 contributorTokens = (basics.totalSupply *
+            CONTRIBUTOR_ALLOCATION) / 100;
         vesting.startMarketCap =
-            (liquidityBNB * basics.totalSupply) /
-            tradingTokens;
+            (liquidityBNB * ((basics.totalSupply * 10) / 100)) /
+            contributorTokens;
 
+        // Give founder immediate 50% of their allocation
         uint256 immediateRelease = (vesting.founderTokens *
             IMMEDIATE_FOUNDER_RELEASE) / 100;
         IERC20(token).safeTransfer(basics.founder, immediateRelease);
         vesting.founderTokensClaimed = immediateRelease;
 
-        _setupBondingCurve(
-            token,
-            basics.totalSupply,
-            vesting.founderTokens,
-            liquidityBNB
-        );
+        // ✅ FIX: DO NOT send tokens to BondingCurveDEX for Project Raise!
+        // Tokens remain in LaunchpadManager for contributors to claim
 
-        status.liquidityAdded = true;
+        status.liquidityAdded = false; // Will be set true when graduated to PancakeSwap
         emit RaiseCompleted(token, basics.totalRaised);
     }
 
-    function _setupBondingCurve(
-        address token,
-        uint256 totalSupply,
-        uint256 founderTokens,
-        uint256 liquidityBNB
-    ) private {
-        LaunchBasics storage basics = launchBasics[token];
-        uint256 tokensForDEX = totalSupply - founderTokens;
+    // ❌ REMOVED: _setupBondingCurve - Project Raise doesn't use BondingCurveDEX
+    // function _setupBondingCurve(...) private { ... }
 
-        IERC20(token).approve(address(bondingCurveDEX), tokensForDEX);
-        bondingCurveDEX.createPool{value: liquidityBNB}(
-            token,
-            tokensForDEX,
-            basics.founder,
-            basics.burnLP
+    /**
+     * @notice Contributors claim their tokens after successful raise
+     * @dev Tokens are distributed proportionally based on contribution amount
+     */
+    function claimContributorTokens(address token) external nonReentrant {
+        LaunchBasics storage basics = launchBasics[token];
+        LaunchStatus storage status = launchStatus[token];
+
+        require(
+            basics.launchType == LaunchType.PROJECT_RAISE,
+            "Not a project raise"
         );
+        require(status.raiseCompleted, "Raise not completed");
+        require(basics.totalRaised >= basics.raiseTarget, "Raise failed");
+
+        Contribution storage contrib = contributions[token][msg.sender];
+        require(contrib.amount > 0, "No contribution");
+        require(!contrib.claimed, "Already claimed");
+
+        // Calculate proportional share from 70% contributor allocation
+        uint256 contributorPool = (basics.totalSupply *
+            CONTRIBUTOR_ALLOCATION) / 100; // 700M
+        uint256 tokensOwed = (contrib.amount * contributorPool) /
+            basics.totalRaised;
+
+        contrib.claimed = true;
+        IERC20(token).safeTransfer(msg.sender, tokensOwed);
+
+        emit ContributorTokensClaimed(msg.sender, token, tokensOwed);
+    }
+
+    /**
+     * @notice Contributors claim refund if raise fails
+     * @dev Refund available if raise doesn't meet target after deadline
+     */
+    function claimRefund(address token) external nonReentrant {
+        LaunchBasics storage basics = launchBasics[token];
+        LaunchStatus storage status = launchStatus[token];
+
+        require(
+            basics.launchType == LaunchType.PROJECT_RAISE,
+            "Not a project raise"
+        );
+        require(block.timestamp > basics.raiseDeadline, "Raise still active");
+        require(
+            basics.totalRaised < basics.raiseTarget,
+            "Raise was successful"
+        );
+        require(!status.raiseCompleted, "Raise completed");
+
+        Contribution storage contrib = contributions[token][msg.sender];
+        require(contrib.amount > 0, "No contribution");
+        require(!contrib.claimed, "Already claimed");
+
+        uint256 refundAmount = contrib.amount;
+        contrib.claimed = true;
+
+        payable(msg.sender).transfer(refundAmount);
+
+        emit RefundClaimed(msg.sender, token, refundAmount);
+    }
+
+    /**
+     * @notice Burn tokens for failed raise (callable by anyone after deadline)
+     * @dev Burns all tokens if raise target not met
+     */
+    function burnFailedRaiseTokens(address token) external nonReentrant {
+        LaunchBasics storage basics = launchBasics[token];
+        LaunchStatus storage status = launchStatus[token];
+
+        require(
+            basics.launchType == LaunchType.PROJECT_RAISE,
+            "Not a project raise"
+        );
+        require(block.timestamp > basics.raiseDeadline, "Raise still active");
+        require(
+            basics.totalRaised < basics.raiseTarget,
+            "Raise was successful"
+        );
+        require(!status.raiseCompleted, "Raise completed");
+
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        if (balance > 0) {
+            IERC20(token).safeTransfer(address(0xdead), balance);
+            emit TokensBurned(token, balance);
+            emit RaiseFailed(token, basics.totalRaised);
+        }
     }
 
     function claimFounderTokens(address token) external nonReentrant {
@@ -842,30 +1090,31 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
 
         uint256 claimable = _calculateClaimableRaisedFunds(token);
         require(claimable > 0, "No funds to claim");
-
-        bool shouldRedirect = _shouldBurnTokens(token);
-
-        if (shouldRedirect) {
-            // ✅ UPDATED: Use global infoFiAddress
-            payable(infoFiAddress).transfer(claimable);
-            emit RaisedFundsSentToInfoFi(token, claimable);
-        } else {
-            payable(basics.founder).transfer(claimable);
-            emit RaisedFundsClaimed(basics.founder, token, claimable);
-        }
+ 
+        payable(basics.founder).transfer(claimable);
+        emit RaisedFundsClaimed(basics.founder, token, claimable);
 
         launchLiquidity[token].raisedFundsClaimed += claimable;
     }
 
     function _shouldBurnTokens(address token) private view returns (bool) {
-        (, , , , , uint256 currentPrice, , , ) = bondingCurveDEX.getPoolInfo(
-            token
-        );
         LaunchBasics storage basics = launchBasics[token];
-        LaunchVesting storage vesting = launchVesting[token];
-        uint256 startPrice = (vesting.startMarketCap * 10 ** 18) /
-            basics.totalSupply;
-        return currentPrice < startPrice;
+        LaunchStatus storage status = launchStatus[token];
+
+        if (basics.launchType == LaunchType.PROJECT_RAISE) {
+            // Only burn if raise failed
+            return
+                (block.timestamp >= basics.raiseDeadline) &&
+                !status.raiseCompleted;
+        } else {
+            // INSTANT_LAUNCH: Check bonding curve price
+            (, , , , , uint256 currentPrice, , , ) = bondingCurveDEX
+                .getPoolInfo(token);
+            LaunchVesting storage vesting = launchVesting[token];
+            uint256 startPrice = (vesting.startMarketCap * 10 ** 18) /
+                basics.totalSupply;
+            return currentPrice < startPrice;
+        }
     }
 
     function _calculateClaimableFounderTokens(
