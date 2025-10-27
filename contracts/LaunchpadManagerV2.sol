@@ -86,7 +86,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "./BondingDEX.sol";
+import "./PriceOracle.sol";
 import "./MockPancakeRouter.sol";
 
 interface ITokenFactoryV2 {
@@ -119,14 +119,13 @@ interface ITokenFactoryV2 {
     ) external returns (address);
 }
 
-interface IBondingCurveDEXV3 {
-    function createPool(
-        address token,
-        uint256 tokenAmount,
-        address creator,
-        bool burnLP
-    ) external payable;
+interface ILaunchpadToken {
 
+function enableTransfers() external;
+function setExemption(address account, bool exempt) external;
+}
+
+interface IBondingCurveDEXV3 {
     function createInstantLaunchPool(
         address token,
         uint256 tokenAmount,
@@ -170,6 +169,46 @@ interface IBondingCurveDEXV3 {
     ) external view returns (uint256 tokensOut, uint256 pricePerToken);
 
     function buyTokens(address token, uint256 minTokensOut) external payable;
+}
+
+interface IPancakeRouter02 {
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    )
+        external
+        payable
+        returns (uint amountToken, uint amountETH, uint liquidity);
+
+    function swapExactTokensForETH(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+
+    function WETH() external pure returns (address);
+
+    function getAmountsOut(
+        uint amountIn,
+        address[] calldata path
+    ) external view returns (uint[] memory amounts);
+}
+
+interface ILPFeeHarvester {
+    function lockLP(
+        address projectToken,
+        address lpToken,
+        address creator,
+        address projectInfoFi,
+        uint256 lpAmount,
+        uint256 lockDuration
+    ) external;
 }
 
 /**
@@ -242,7 +281,6 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
     address public constant LP_BURN_ADDRESS =
         0x000000000000000000000000000000000000dEaD;
 
-    AggregatorV3Interface public priceFeed;
     ITokenFactoryV2 public tokenFactory;
     IBondingCurveDEXV3 public bondingCurveDEX;
     IPancakeRouter02 public pancakeRouter;
@@ -372,22 +410,7 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         useOraclePrice = true;
     }
 
-    function getBNBPrice() public view returns (uint256) {
-        if (!useOraclePrice) return fallbackBNBPrice;
-        try priceFeed.latestRoundData() returns (
-            uint80,
-            int256 price,
-            uint256,
-            uint256 updatedAt,
-            uint80
-        ) {
-            require(block.timestamp - updatedAt <= 3600, "Stale price");
-            require(price > 0, "Invalid price");
-            return uint256(price);
-        } catch {
-            return fallbackBNBPrice;
-        }
-    }
+   
 
     // ✅ UPDATED: Removed projectInfoFiWallet parameter
     function createLaunch(
@@ -1090,7 +1113,7 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
 
         uint256 claimable = _calculateClaimableRaisedFunds(token);
         require(claimable > 0, "No funds to claim");
- 
+
         payable(basics.founder).transfer(claimable);
         emit RaisedFundsClaimed(basics.founder, token, claimable);
 
@@ -1175,11 +1198,6 @@ contract LaunchpadManagerV3 is ReentrancyGuard, Ownable {
         return totalVested - liquidity.raisedFundsClaimed;
     }
 
-    function updatePriceFeed(address _priceFeed) external onlyOwner {
-        require(_priceFeed != address(0), "Invalid address");
-        priceFeed = AggregatorV3Interface(_priceFeed);
-        emit PriceFeedUpdated(_priceFeed);
-    }
 
     function updateFallbackPrice(uint256 _price) external onlyOwner {
         require(_price > 0, "Invalid price");
