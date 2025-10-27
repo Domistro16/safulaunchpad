@@ -44,7 +44,7 @@ describe("BondingCurveDEX - INSTANT_LAUNCH Tests", function () {
   let mockPancakeFactory: MockPancakeFactory;
 
   const INITIAL_LIQUIDITY_BNB = ethers.parseEther("50");
-  const INITIAL_LIQUIDITY_TOKENS = ethers.parseEther("700000000");
+  const INITIAL_LIQUIDITY_TOKENS = ethers.parseEther("1000000000"); // ✅ FIXED: Must be 1B (100% of total) for createInstantLaunchPool
   const BNB_PRICE_USD = ethers.parseEther("580"); // $580 per BNB
 
   const defaultMetadata = {
@@ -145,9 +145,9 @@ describe("BondingCurveDEX - INSTANT_LAUNCH Tests", function () {
       INITIAL_LIQUIDITY_TOKENS
     );
 
-    // ✅ CLARIFICATION: This creates a pool for INSTANT_LAUNCH with initial BNB seeding
-    // NOT for PROJECT_RAISE (which doesn't use BondingCurveDEX)
-    await bondingCurveDEX.createPool(
+    // ✅ FIXED: Use createInstantLaunchPool for INSTANT_LAUNCH (not createPool which is for PROJECT_RAISE)
+    // BondingCurveDEX is ONLY for INSTANT_LAUNCH. PROJECT_RAISE uses LaunchpadManager directly.
+    await bondingCurveDEX.createInstantLaunchPool(
       await token.getAddress(),
       INITIAL_LIQUIDITY_TOKENS,
       owner.address, // creator
@@ -162,9 +162,9 @@ describe("BondingCurveDEX - INSTANT_LAUNCH Tests", function () {
         await token.getAddress()
       );
 
-      // ✅ FIXED: Expected reserve is now 630M (90% of 700M = tokens on curve)
-      // Note: This is for INSTANT_LAUNCH pools, not PROJECT_RAISE
-      const expectedReserve = (INITIAL_LIQUIDITY_TOKENS * 90n) / 100n;
+      // ✅ FIXED: Expected reserve is 800M tokens on curve
+      // Input: 900M (90% of 1B), Reserved: 100M (10% of 1B), On curve: 800M (80% of 1B)
+      const expectedReserve = ethers.parseEther("800000000"); // 800M tokens
       expect(poolInfo.bnbReserve).to.equal(INITIAL_LIQUIDITY_BNB);
       expect(poolInfo.tokenReserve).to.equal(expectedReserve);
       expect(poolInfo.graduated).to.be.false;
@@ -180,7 +180,7 @@ describe("BondingCurveDEX - INSTANT_LAUNCH Tests", function () {
 
     it("Should reject pool creation for existing token", async function () {
       await expect(
-        bondingCurveDEX.createPool(
+        bondingCurveDEX.createInstantLaunchPool(
           await token.getAddress(),
           INITIAL_LIQUIDITY_TOKENS,
           owner.address, // creator
@@ -819,7 +819,7 @@ describe("BondingCurveDEX - INSTANT_LAUNCH Tests", function () {
         INITIAL_LIQUIDITY_TOKENS
       );
 
-      await bondingCurveDEX.createPool(
+      await bondingCurveDEX.createInstantLaunchPool(
         await tokenHigh.getAddress(),
         INITIAL_LIQUIDITY_TOKENS,
         owner.address, // creator
